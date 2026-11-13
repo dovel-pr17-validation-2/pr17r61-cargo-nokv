@@ -1,0 +1,75 @@
+//! Immutable Agent artifact storage for NoKV.
+//!
+//! Permanent keys are owned by an artifact revision and remain independent of
+//! object-provider endpoints and physical shard owners. This crate uploads and
+//! verifies immutable blocks, plans strict range reads, exposes S3-compatible
+//! and in-memory durable stores, and provides local soft caches. Namespace
+//! visibility, revision reachability, metadata transactions, and GC policy live
+//! in `nokv-meta`.
+//!
+//! Failed stable-append attempts additionally use permanent empty-object seals.
+//! Their metadata authority must fence publication and reserve revision keys
+//! forever before calling `seal_immutable`. S3 sealing uses conditional PUTs,
+//! never DELETE, so late immutable uploads cannot restore payload bytes. The
+//! append-specific provider admission profile verifies this stronger boundary;
+//! ordinary publication admission does not imply sealing support. Seal keys
+//! must be excluded from external deletion and expiration. In versioned buckets,
+//! sealing changes the current object only; it does not remove older versions.
+
+mod admission;
+mod artifact;
+mod cache;
+pub(crate) mod chunked_immutable_blob;
+mod digest;
+mod local_hot;
+mod namespace;
+#[cfg(test)]
+mod provider_admission_test;
+mod recovery_checkpoint;
+mod recovery_log_segment;
+mod store;
+mod tiered;
+
+pub use admission::{
+    admit_artifact_provider, AdmittedCreateMode, ProviderAdmissionCapability,
+    ProviderAdmissionError, ProviderAdmissionProfile, ProviderAdmissionReceipt,
+    ProviderHandleIdentity, MAX_SINGLE_PUT_ADMISSION_BYTES, PROVIDER_ADMISSION_CONTRACT_VERSION,
+};
+pub use artifact::{
+    plan_artifact_read, plan_artifact_upload, read_artifact, read_artifact_range,
+    read_artifact_window, verify_artifact_bytes, ArtifactBlock, ArtifactBlockRead,
+    ArtifactKeyspace, ArtifactManifest, ArtifactReadOutcome, ArtifactReadPlan, ArtifactReadStats,
+    ArtifactReadWindow, ArtifactUploadOptions, ArtifactUploadPlan, DEFAULT_ARTIFACT_BLOCK_SIZE,
+};
+pub use cache::{
+    ArtifactBlockCache, ArtifactCacheStats, MemoryArtifactCache, MemoryArtifactCacheOptions,
+};
+pub use local_hot::{LocalHotTier, LocalHotTierOptions, LocalHotTierStats};
+pub use namespace::{
+    ensure_object_namespace, load_object_namespace, verify_object_namespace, BoundArtifactStore,
+    OBJECT_NAMESPACE_MARKER_KEY,
+};
+pub use recovery_checkpoint::{
+    plan_recovery_checkpoint_blob, read_recovery_checkpoint_blob,
+    write_recovery_checkpoint_blob_from_plan, RecoveryCheckpointBlob, RecoveryCheckpointBlobPlan,
+    RecoveryCheckpointBlobReceipt, RecoveryCheckpointBoundary, RecoveryCheckpointError,
+    RecoveryCheckpointIdentity, RecoveryCheckpointWrite, DEFAULT_RECOVERY_CHECKPOINT_CHUNK_SIZE,
+    MAX_RECOVERY_CHECKPOINT_CHUNKS, MAX_RECOVERY_CHECKPOINT_ENVELOPE_BYTES,
+};
+pub use recovery_log_segment::{
+    plan_recovery_log_segment, read_recovery_log_segment, write_recovery_log_segment_from_plan,
+    RecoveryLogSegment, RecoveryLogSegmentError, RecoveryLogSegmentIdentity,
+    RecoveryLogSegmentPlan, RecoveryLogSegmentReceipt, RecoveryLogSegmentWrite,
+    DEFAULT_RECOVERY_LOG_SEGMENT_CHUNK_SIZE, MAX_RECOVERY_LOG_SEGMENT_BYTES,
+    MAX_RECOVERY_LOG_SEGMENT_CHUNKS,
+};
+pub use store::{
+    ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
+    MemoryArtifactStoreStats, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
+    ObjectSealOutcome, S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_S3_MULTIPART_CONCURRENCY,
+    DEFAULT_S3_MULTIPART_PART_SIZE,
+};
+pub use tiered::{TieredArtifactStore, TieredArtifactStoreOptions, TieredArtifactStoreStats};
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,47 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+.DS_Store
+.idea
+.vscode
+
+# Rust build output
+target/
+**/target/
+
+# Python cache output
+__pycache__/
+*.pyc
+.venv/
+**/.venv/
+
+# Python native extension + packaging build artifacts (built by maturin)
+*.so
+*.dylib
+*.pyd
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Docs
+docs/node_modules/
+docs/.vitepress/dist/
+
+# Local scratch data
+artifacts/
+work_test/
+testdata/
+coverage.out
+*.pprof
+
+# Local benchmark corpus materializations and run results (never commit)
+bench/data/
+*.jsonl
+
+# Published benchmark result telemetry (committed deliberately)
+!bench/agent-interface/results/*.jsonl
+third_party/
+
+# Benchmark run output
+bench/results/

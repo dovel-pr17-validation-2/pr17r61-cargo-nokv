@@ -1,0 +1,44 @@
+[package]
+name = "nokv"
+version = "0.20.0"
+description = "Custom CLI and shard-owner process for NoKV Agent workspaces."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["etcd"]
+control = ["nokv-client/control", "dep:signal-hook"]
+etcd = ["control", "nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+nokv-client.workspace = true
+nokv-control.workspace = true
+nokv-object.workspace = true
+nokv-protocol.workspace = true
+nokv-server.workspace = true
+nokv-agent.workspace = true
+nokv-workbench-projection.workspace = true
+nokv-types.workspace = true
+rustix.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+signal-hook = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[[bin]]
+name = "nokv"
+path = "src/main.rs"
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true

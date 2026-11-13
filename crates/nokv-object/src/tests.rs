@@ -1,0 +1,426 @@
+use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
+
+use super::*;
+
+fn logical_shard(byte: u8) -> LogicalShardId {
+    LogicalShardId::from_bytes([byte; 16])
+}
+
+fn root(byte: u8) -> RootId {
+    RootId::from_bytes([byte; 16])
+}
+
+fn revision(byte: u8) -> ArtifactRevisionId {
+    ArtifactRevisionId::from_bytes([byte; 16])
+}
+
+fn options(revision_byte: u8) -> ArtifactUploadOptions {
+    ArtifactUploadOptions::new(logical_shard(1), root(2), revision(revision_byte))
+        .with_block_size(4)
+}
+
+/// Write a body the way the owner does: one immutable object per planned
+/// block, from the plan computed before any write.
+fn execute_upload(
+    store: &dyn ArtifactObjectStore,
+    upload_options: ArtifactUploadOptions,
+    bytes: &[u8],
+) -> ArtifactManifest {
+    let plan = plan_artifact_upload(upload_options, bytes).unwrap();
+    for block in &plan.manifest.blocks {
+        let start = usize::try_from(block.logical_offset).unwrap();
+        let end = start + usize::try_from(block.len).unwrap();
+        store
+            .create_immutable(&block.key, &bytes[start..end])
+            .unwrap();
+    }
+    plan.manifest
+}
+
+#[test]
+fn permanent_keys_are_owned_by_logical_shard_root_and_revision() {
+    let keyspace = ArtifactKeyspace {
+        logical_shard_id: logical_shard(1),
+        root_id: root(2),
+        artifact_revision_id: revision(3),
+    };
+    let key = keyspace.permanent_block_key(7);
+    assert_eq!(
+        key.as_str(),
+        concat!(
+            "nokv/artifacts/01010101010101010101010101010101/",
+            "02020202020202020202020202020202/",
+            "03030303030303030303030303030303/blocks/0000000000000007"
+        )
+    );
+    assert_ne!(
+        key,
+        ArtifactKeyspace {
+            logical_shard_id: logical_shard(9),
+            ..keyspace
+        }
+        .permanent_block_key(7)
+    );
+    assert_ne!(
+        key,
+        ArtifactKeyspace {
+            root_id: root(9),
+            ..keyspace
+        }
+        .permanent_block_key(7)
+    );
+    assert_ne!(
+        key,
+        ArtifactKeyspace {
+            artifact_revision_id: revision(9),
+            ..keyspace
+        }
+        .permanent_block_key(7)
+    );
+    assert!(!key.as_str().contains("http"));
+}
+
+#[test]
+fn provider_neutral_keys_reject_ambiguous_components() {
+    assert_eq!(ObjectKey::new(""), Err(ObjectError::EmptyKey));
+    assert_eq!(ObjectKey::new("/absolute"), Err(ObjectError::AbsoluteKey));
+    assert_eq!(ObjectKey::new("a//b"), Err(ObjectError::EmptyKeyComponent));
+    assert_eq!(ObjectKey::new("a/../b"), Err(ObjectError::ParentTraversal));
+    assert_eq!(ObjectKey::new("a/./b"), Err(ObjectError::CurrentDirectory));
+    assert_eq!(ObjectKey::new(r"a\b"), Err(ObjectError::BackslashInKey));
+}
+
+#[test]
+fn immutable_create_accepts_only_exact_replay() {
+    let store = MemoryArtifactStore::new();
+    let key = ObjectKey::new("nokv/artifacts/a").unwrap();
+    assert_eq!(
+        store.create_immutable(&key, b"alpha").unwrap(),
+        ImmutableCreateOutcome::Created
+    );
+    assert_eq!(
+        store.create_immutable(&key, b"alpha").unwrap(),
+        ImmutableCreateOutcome::Replayed
+    );
+    assert!(matches!(
+        store.create_immutable(&key, b"beta"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+    assert_eq!(store.read(&key, None).unwrap(), b"alpha");
+    let stats = store.stats().unwrap();
+    assert_eq!(stats.creates, 1);
+    assert_eq!(stats.replays, 1);
+    assert_eq!(stats.collisions, 1);
+}
+
+#[test]
+fn sealing_absent_and_uploaded_objects_permanently_rejects_late_payload() {
+    let store = MemoryArtifactStore::new();
+    let absent = ObjectKey::new("nokv/artifacts/absent").unwrap();
+    let uploaded = ObjectKey::new("nokv/artifacts/uploaded").unwrap();
+    store
+        .create_immutable(&uploaded, b"abandoned payload")
+        .unwrap();
+    for key in [&absent, &uploaded] {
+        assert_eq!(
+            store.seal_immutable(key).unwrap(),
+            ObjectSealOutcome::Sealed
+        );
+        assert_eq!(
+            store.seal_immutable(key).unwrap(),
+            ObjectSealOutcome::AlreadySealed
+        );
+        assert!(matches!(
+            store.create_immutable(key, b"abandoned payload"),
+            Err(ObjectError::ImmutableCollision { .. })
+        ));
+        assert_eq!(store.head(key).unwrap().unwrap().size, 0);
+        assert!(store.read(key, None).unwrap().is_empty());
+    }
+    let stats = store.stats().unwrap();
+    assert_eq!(stats.resident_bytes, 0);
+    assert_eq!(stats.resident_objects, 2);
+    assert_eq!(stats.seals, 2);
+    assert_eq!(stats.deletes, 0);
+    assert!(store
+        .provider_admission_receipt()
+        .unwrap()
+        .admits_append_store(&store, 4));
+}
+
+#[test]
+fn concurrent_sealers_and_late_writers_converge_without_deleting_the_key() {
+    let store = MemoryArtifactStore::new();
+    let key = ObjectKey::new("nokv/artifacts/seal-race").unwrap();
+    let barrier = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            let store = &store;
+            let key = &key;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                if index % 2 == 0 {
+                    store.seal_immutable(key).unwrap();
+                } else {
+                    let result = store.create_immutable(key, b"payload");
+                    assert!(
+                        result.is_ok()
+                            || matches!(result, Err(ObjectError::ImmutableCollision { .. }))
+                    );
+                }
+            });
+        }
+        barrier.wait();
+    });
+    assert_eq!(store.head(&key).unwrap().unwrap().size, 0);
+    assert_eq!(store.stats().unwrap().deletes, 0);
+    assert!(matches!(
+        store.create_immutable(&key, b"late"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+}
+
+#[test]
+fn tiered_sealing_uses_the_durable_fence_and_invalidates_old_cache_bytes() {
+    let hot = MemoryArtifactStore::new();
+    let durable = MemoryArtifactStore::new();
+    let store = TieredArtifactStore::new(hot.clone(), durable.clone(), Default::default());
+    let key = ObjectKey::new("nokv/artifacts/tiered-seal").unwrap();
+    store.create_immutable(&key, b"old payload").unwrap();
+    assert_eq!(hot.read(&key, None).unwrap(), b"old payload");
+    store.seal_immutable(&key).unwrap();
+    assert!(hot.head(&key).unwrap().is_none());
+    assert_eq!(durable.head(&key).unwrap().unwrap().size, 0);
+    assert!(store.read(&key, None).unwrap().is_empty());
+    assert!(matches!(
+        store.create_immutable(&key, b"late payload"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+    assert_eq!(durable.stats().unwrap().deletes, 0);
+}
+
+#[test]
+fn namespace_and_arc_wrappers_preserve_sealing_and_its_receipt() {
+    let inner = std::sync::Arc::new(MemoryArtifactStore::new());
+    let namespace = nokv_types::ObjectNamespaceId::from_bytes([9; 16]);
+    ensure_object_namespace(&inner, namespace).unwrap();
+    let store = BoundArtifactStore::open(inner.clone(), namespace).unwrap();
+    let key = ObjectKey::new("nokv/artifacts/bound-seal").unwrap();
+    store.seal_immutable(&key).unwrap();
+    assert_eq!(inner.head(&key).unwrap().unwrap().size, 0);
+    assert!(store
+        .provider_admission_receipt()
+        .unwrap()
+        .admits_append_store(&store, 4));
+}
+
+#[test]
+fn an_evictable_local_cache_cannot_certify_permanent_sealing() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = LocalHotTier::new(LocalHotTierOptions::new(temp.path(), 4)).unwrap();
+    let key = ObjectKey::new("nokv/artifacts/cache-seal").unwrap();
+    assert_eq!(
+        store.seal_immutable(&key),
+        Err(ObjectError::ImmutableSealingUnsupported)
+    );
+    assert!(store.head(&key).unwrap().is_none());
+}
+
+#[test]
+fn upload_range_read_and_exact_replay_share_one_manifest() {
+    let store = MemoryArtifactStore::new();
+    let uploaded = execute_upload(&store, options(3), b"abcdefghij");
+    assert_eq!(uploaded.blocks.len(), 3);
+    assert_eq!(store.stats().unwrap().resident_objects, 3);
+
+    let replay = execute_upload(&store, options(3), b"abcdefghij");
+    assert_eq!(replay, uploaded);
+    assert_eq!(store.stats().unwrap().resident_objects, 3);
+
+    let range = read_artifact_range(&store, None, &uploaded, 2, 7).expect("valid strict range");
+    assert_eq!(range.bytes, b"cdefghi");
+    assert_eq!(range.stats.planned_blocks, 3);
+    assert_eq!(range.stats.verified_blocks, 3);
+
+    let whole = read_artifact(&store, None, &uploaded).unwrap();
+    assert_eq!(whole.bytes, b"abcdefghij");
+}
+
+#[test]
+fn upload_plan_is_pure_deterministic_and_precedes_object_writes() {
+    let store = MemoryArtifactStore::new();
+    let first = plan_artifact_upload(options(9), b"abcdefgh").unwrap();
+    let second = plan_artifact_upload(options(9), b"abcdefgh").unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.manifest.blocks.len(), 2);
+    assert_eq!(store.stats().unwrap().resident_objects, 0);
+
+    let uploaded = execute_upload(&store, options(9), b"abcdefgh");
+    assert_eq!(uploaded, first.manifest);
+    assert_eq!(store.stats().unwrap().resident_objects, 2);
+}
+
+#[test]
+fn strict_ranges_and_block_digests_are_verified() {
+    let store = MemoryArtifactStore::new();
+    let uploaded = execute_upload(&store, options(5), b"abcdefgh");
+    assert!(matches!(
+        plan_artifact_read(&uploaded, 7, 2),
+        Err(ObjectError::InvalidRange { .. })
+    ));
+    assert!(matches!(
+        plan_artifact_read(&uploaded, 0, 0),
+        Err(ObjectError::InvalidRange { .. })
+    ));
+
+    let mut corrupt_manifest = uploaded.clone();
+    corrupt_manifest.blocks[0].sha256 = [0xff; 32];
+    assert!(matches!(
+        read_artifact(&store, None, &corrupt_manifest),
+        Err(ObjectError::DigestMismatch { .. })
+    ));
+
+    let mut corrupt_artifact_digest = uploaded.clone();
+    corrupt_artifact_digest.sha256 = [0xee; 32];
+    assert!(matches!(
+        read_artifact(&store, None, &corrupt_artifact_digest),
+        Err(ObjectError::DigestMismatch { .. })
+    ));
+}
+
+#[test]
+fn bounded_read_windows_reject_gaps_and_overlaps_without_synthesizing_bytes() {
+    let store = MemoryArtifactStore::new();
+    let uploaded = execute_upload(&store, options(11), b"abcdefghijkl");
+    let mut window = ArtifactReadWindow {
+        logical_shard_id: uploaded.logical_shard_id,
+        root_id: uploaded.root_id,
+        artifact_revision_id: uploaded.artifact_revision_id,
+        artifact_logical_len: uploaded.logical_len,
+        blocks: vec![uploaded.blocks[0].clone(), uploaded.blocks[2].clone()],
+    };
+    assert!(matches!(
+        read_artifact_window(&store, None, &window, 0, 12),
+        Err(ObjectError::InvalidManifest(_))
+    ));
+
+    window.blocks[1] = uploaded.blocks[1].clone();
+    window.blocks[1].logical_offset = 3;
+    assert!(matches!(
+        read_artifact_window(&store, None, &window, 0, 8),
+        Err(ObjectError::InvalidManifest(_))
+    ));
+}
+
+#[test]
+fn empty_artifact_has_a_canonical_manifest() {
+    let store = MemoryArtifactStore::new();
+    let uploaded = execute_upload(&store, options(6), b"");
+    assert!(uploaded.blocks.is_empty());
+    assert_eq!(
+        read_artifact(&store, None, &uploaded).unwrap().bytes,
+        Vec::<u8>::new()
+    );
+}
+
+#[test]
+fn memory_cache_evicts_and_recovers_from_corruption() {
+    let store = MemoryArtifactStore::new();
+    let uploaded = execute_upload(&store, options(7), b"abcdefgh");
+    let cache = MemoryArtifactCache::new(MemoryArtifactCacheOptions {
+        max_bytes: 4,
+        max_entries: 1,
+    });
+
+    let first = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
+    assert_eq!(first.stats.store_reads, 1);
+    let second = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
+    assert_eq!(second.stats.cache_hits, 1);
+    assert_eq!(second.stats.store_reads, 0);
+
+    let key = uploaded.blocks[0].key.clone();
+    cache.insert(key, b"zzzz".to_vec()).unwrap();
+    let recovered = read_artifact_range(&store, Some(&cache), &uploaded, 0, 4).unwrap();
+    assert_eq!(recovered.bytes, b"abcd");
+    assert_eq!(recovered.stats.cache_misses, 1);
+    assert_eq!(recovered.stats.store_reads, 1);
+}
+
+#[test]
+fn local_hot_tier_enforces_capacity_without_overwriting() {
+    let temp = tempfile::tempdir().unwrap();
+    let hot = LocalHotTier::new(LocalHotTierOptions::new(temp.path(), 4)).unwrap();
+    let first = ObjectKey::new("nokv/artifacts/first").unwrap();
+    let second = ObjectKey::new("nokv/artifacts/second").unwrap();
+
+    assert_eq!(
+        hot.create_immutable(&first, b"aaaa").unwrap(),
+        ImmutableCreateOutcome::Created
+    );
+    assert_eq!(
+        hot.create_immutable(&second, b"bbbb").unwrap(),
+        ImmutableCreateOutcome::Created
+    );
+    assert!(hot.head(&first).unwrap().is_none());
+    assert!(hot.head(&second).unwrap().is_some());
+    assert!(matches!(
+        hot.create_immutable(&second, b"cccc"),
+        Err(ObjectError::ImmutableCollision { .. })
+    ));
+    let stats = hot.stats().unwrap();
+    assert_eq!(stats.evictions, 1);
+    assert_eq!(stats.resident_bytes, 4);
+
+    let reopened = LocalHotTier::new(LocalHotTierOptions::new(temp.path(), 3)).unwrap();
+    assert!(reopened.head(&second).unwrap().is_none());
+    assert_eq!(reopened.stats().unwrap().resident_bytes, 0);
+}
+
+#[test]
+fn tiered_store_reads_durable_then_uses_hot_tier() {
+    let hot = MemoryArtifactStore::new();
+    let durable = MemoryArtifactStore::new();
+    let key = ObjectKey::new("nokv/artifacts/tiered").unwrap();
+    durable.create_immutable(&key, b"payload").unwrap();
+    let tiered = TieredArtifactStore::new(
+        hot.clone(),
+        durable.clone(),
+        TieredArtifactStoreOptions::default(),
+    );
+
+    assert_eq!(tiered.read(&key, None).unwrap(), b"payload");
+    assert_eq!(hot.read(&key, None).unwrap(), b"payload");
+    assert_eq!(tiered.read(&key, None).unwrap(), b"payload");
+    let stats = tiered.stats().unwrap();
+    assert_eq!(stats.hot_misses, 1);
+    assert_eq!(stats.hot_hits, 1);
+    assert_eq!(stats.durable_reads, 1);
+    assert_eq!(stats.hot_populates, 1);
+}
+
+#[test]
+fn object_ranges_are_strict_not_truncated() {
+    let store = MemoryArtifactStore::new();
+    let key = ObjectKey::new("nokv/artifacts/range").unwrap();
+    store.create_immutable(&key, b"abcd").unwrap();
+    assert_eq!(
+        store
+            .read(&key, Some(ObjectRange::new(1, 2).unwrap()))
+            .unwrap(),
+        b"bc"
+    );
+    assert!(matches!(
+        store.read(&key, Some(ObjectRange::new(3, 2).unwrap())),
+        Err(ObjectError::InvalidRange { .. })
+    ));
+}
+
+#[test]
+fn s3_options_require_durable_coordinates() {
+    let mut options = S3ArtifactStoreOptions::new("");
+    assert_eq!(options.validate(), Err(ObjectError::MissingBucket));
+    options.bucket = "artifacts".to_owned();
+    options.region.clear();
+    assert_eq!(options.validate(), Err(ObjectError::MissingRegion));
+}

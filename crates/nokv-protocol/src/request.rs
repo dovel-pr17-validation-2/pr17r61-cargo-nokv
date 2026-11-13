@@ -1,0 +1,3036 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use serde::{Deserialize, Serialize};
+
+use crate::artifact_publish::MAX_ARTIFACT_UPLOAD_BODY_BYTES;
+use crate::error::ProtocolError;
+use crate::types::{
+    validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
+    ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange, CommitIdentity, Digest, DigestUri,
+    GenericIndexGenerationIdentity, OperationIdentity, OperationToken, PageRequest,
+    PublicationAuthority, PublishCondition, RequestIdentity, RootRoute, ScalarValue, SnapshotAlias,
+    SnapshotSelector, StagedObject, WorkbenchName, WorkspaceCapability, WorkspaceIdentity,
+    WorkspacePath, WorkspaceReadView,
+};
+use crate::{
+    inline_artifact_body_digest, sha256_digest_uri, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_INLINE_ARTIFACT_BODY_BYTES, WORKSPACE_CAPABILITY_SCHEMA,
+    WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
+};
+
+const MAX_QUERY_PREDICATES: usize = 64;
+const MAX_QUERY_IN_VALUES: usize = 64;
+const MAX_QUERY_FIELDS: usize = 64;
+const MAX_SORT_FIELDS: usize = 8;
+const MAX_FACET_FIELDS: usize = 16;
+const GENERIC_INDEX_BUILTIN_FIELD_IDS: &[&str] = &[
+    "body.content_type",
+    "body.manifest_id",
+    "body.producer",
+    "kind",
+    "name",
+    "path",
+    "size_bytes",
+];
+/// Maximum custom fields declared by one Generic custom-index generation.
+pub const MAX_GENERIC_INDEX_FIELDS: usize = 60;
+/// Maximum field groups retained in one Generic custom-index row.
+pub const MAX_GENERIC_INDEX_ROW_FIELDS: usize = 60;
+/// Maximum encoded durable payload for one Generic custom-index row.
+pub const MAX_GENERIC_INDEX_ROW_BYTES: usize = 60 * 1_024;
+/// Maximum ordered values retained for one field in one Generic custom-index row.
+pub const MAX_GENERIC_INDEX_VALUES_PER_FIELD: usize = 1_024;
+/// Maximum rows accepted by one Generic custom-index append RPC.
+pub const MAX_GENERIC_INDEX_APPEND_ROWS: usize = 240;
+/// Maximum generation rows removed by one Generic custom-index abort RPC.
+pub const MAX_GENERIC_INDEX_ABORT_ROWS: u32 = 120;
+/// Maximum page size accepted by metadata query, catalog, and discovery RPCs.
+pub const MAX_QUERY_PAGE_LIMIT: u32 = 256;
+/// Maximum events in one `ReadChanges` page. The feed is polled while writers
+/// run: one reader tailing full 256-event pages at full speed cost eight
+/// concurrent writers 74% of their throughput on the reference stack, and at
+/// 64 events per page they lose 8% to 17%.
+pub const MAX_CHANGE_PAGE_LIMIT: u32 = 64;
+const _: () = assert!(MAX_CHANGE_PAGE_LIMIT <= MAX_QUERY_PAGE_LIMIT);
+pub(crate) const MAX_PARENT_COMMITS: usize = 32;
+const MAX_RESTORE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const _: () = assert!(MAX_QUERY_PAGE_LIMIT <= PageRequest::MAX_LIMIT);
+
+/// One root-routed metadata or lifecycle request.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRpcRequest {
+    pub route: RootRoute,
+    pub request_id: RequestIdentity,
+    pub operation: WorkspaceRequest,
+}
+
+impl WorkspaceRpcRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.route.validate()?;
+        self.operation.validate()
+    }
+}
+
+/// Complete Agent workspace RPC surface.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "operation", content = "request", rename_all = "snake_case")]
+pub enum WorkspaceRequest {
+    Preflight(WorkspacePreflightRequest),
+    CreateWorkspace(CreateWorkspaceRequest),
+    GetWorkspace(GetWorkspaceRequest),
+    GetPath(GetPathRequest),
+    ListPaths(ListPathsRequest),
+    RenamePath(RenamePathRequest),
+    RemovePath(RemovePathRequest),
+    BeginArtifactPublish(BeginArtifactPublishRequest),
+    StageArtifactObjects(StageArtifactObjectsRequest),
+    UploadArtifactObject(UploadArtifactObjectRequest),
+    StageArtifactManifest(StageArtifactManifestRequest),
+    CompleteArtifactPublish(CompleteArtifactPublishRequest),
+    PrepareArtifactPublish(PrepareArtifactPublishRequest),
+    FinishArtifactPublish(FinishArtifactPublishRequest),
+    PublishInlineArtifact(PublishInlineArtifactRequest),
+    AbortArtifactPublish(AbortArtifactPublishRequest),
+    ReconcileQuarantinedArtifactPublish(ReconcileQuarantinedArtifactPublishRequest),
+    Commit(CommitRequest),
+    GetSnapshot(GetSnapshotRequest),
+    MintSnapshot(MintSnapshotRequest),
+    RenewSnapshot(RenewSnapshotRequest),
+    RetireSnapshot(RetireSnapshotRequest),
+    ListSnapshots(ListSnapshotsRequest),
+    PrepareRestore(PrepareRestoreRequest),
+    BindRestoreDestination(BindRestoreDestinationRequest),
+    ReadRestoreSourceRunManifest(ReadRestoreSourceRunManifestRequest),
+    FinalizeRestore(FinalizeRestoreRequest),
+    GetOperation(GetOperationRequest),
+    InspectAppendCleanup(crate::InspectAppendCleanupRequest),
+    RetryAppendCleanup(crate::RetryAppendCleanupRequest),
+    BeginGenericIndexRegistration(BeginGenericIndexRegistrationRequest),
+    AppendGenericIndexRows(AppendGenericIndexRowsRequest),
+    FinalizeGenericIndexRegistration(FinalizeGenericIndexRegistrationRequest),
+    AbortGenericIndexRegistration(AbortGenericIndexRegistrationRequest),
+    GetGenericIndexRegistration(GetGenericIndexRegistrationRequest),
+    Search(SearchRequest),
+    Aggregate(AggregateRequest),
+    Catalog(CatalogRequest),
+    FindWorkspaces(FindWorkspacesRequest),
+    ReadChanges(ChangePageRequest),
+}
+
+impl WorkspaceRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Preflight(request) => request.validate(),
+            Self::CreateWorkspace(request) => request.validate(),
+            Self::GetWorkspace(request) => request.validate(),
+            Self::GetPath(request) => request.validate(),
+            Self::ListPaths(request) => request.validate(),
+            Self::RenamePath(request) => request.validate(),
+            Self::RemovePath(request) => request.validate(),
+            Self::BeginArtifactPublish(request) => {
+                require_object_backed_begin("begin_artifact_publish", request)?;
+                request.validate()
+            }
+            Self::StageArtifactObjects(request) => request.validate(),
+            Self::UploadArtifactObject(request) => request.validate(),
+            Self::StageArtifactManifest(request) => request.validate(),
+            Self::CompleteArtifactPublish(request) => request.validate(),
+            Self::PrepareArtifactPublish(request) => request.validate(),
+            Self::FinishArtifactPublish(request) => request.validate(),
+            Self::PublishInlineArtifact(request) => request.validate(),
+            Self::AbortArtifactPublish(request) => request.validate(),
+            Self::ReconcileQuarantinedArtifactPublish(request) => request.validate(),
+            Self::Commit(request) => request.validate(),
+            Self::GetSnapshot(request) => request.validate(),
+            Self::MintSnapshot(request) => request.validate(),
+            Self::RenewSnapshot(request) => request.validate(),
+            Self::RetireSnapshot(request) => request.validate(),
+            Self::ListSnapshots(request) => request.validate(),
+            Self::PrepareRestore(request) => request.validate(),
+            Self::BindRestoreDestination(request) => request.validate(),
+            Self::ReadRestoreSourceRunManifest(request) => request.validate(),
+            Self::FinalizeRestore(request) => request.validate(),
+            Self::GetOperation(request) => request.validate(),
+            Self::InspectAppendCleanup(request) => request.validate(),
+            Self::RetryAppendCleanup(_) => Ok(()),
+            Self::BeginGenericIndexRegistration(request) => request.validate(),
+            Self::AppendGenericIndexRows(request) => request.validate(),
+            Self::FinalizeGenericIndexRegistration(request) => request.validate(),
+            Self::AbortGenericIndexRegistration(request) => request.validate(),
+            Self::GetGenericIndexRegistration(request) => request.validate(),
+            Self::Search(request) => request.validate(),
+            Self::Aggregate(request) => request.validate(),
+            Self::Catalog(request) => request.validate(),
+            Self::FindWorkspaces(request) => request.validate(),
+            Self::ReadChanges(request) => request.validate(),
+        }
+    }
+}
+
+/// Fail-closed capability negotiation for one exact root route.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePreflightRequest {
+    pub preflight_schema: String,
+    pub protocol_schema: String,
+    pub capability_schema: String,
+    pub required_capabilities: Vec<WorkspaceCapability>,
+}
+
+impl WorkspacePreflightRequest {
+    pub fn new(required_capabilities: impl IntoIterator<Item = WorkspaceCapability>) -> Self {
+        let mut required_capabilities = required_capabilities.into_iter().collect::<Vec<_>>();
+        required_capabilities.sort_unstable();
+        required_capabilities.dedup();
+        Self {
+            preflight_schema: WORKSPACE_PREFLIGHT_SCHEMA.to_owned(),
+            protocol_schema: WORKSPACE_PROTOCOL_SCHEMA.to_owned(),
+            capability_schema: WORKSPACE_CAPABILITY_SCHEMA.to_owned(),
+            required_capabilities,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_exact_schema(
+            "preflight.preflight_schema",
+            &self.preflight_schema,
+            WORKSPACE_PREFLIGHT_SCHEMA,
+        )?;
+        validate_exact_schema(
+            "preflight.protocol_schema",
+            &self.protocol_schema,
+            WORKSPACE_PROTOCOL_SCHEMA,
+        )?;
+        validate_exact_schema(
+            "preflight.capability_schema",
+            &self.capability_schema,
+            WORKSPACE_CAPABILITY_SCHEMA,
+        )?;
+        validate_capability_set(
+            "preflight.required_capabilities",
+            &self.required_capabilities,
+        )
+    }
+}
+
+fn validate_exact_schema(
+    field: &'static str,
+    actual: &str,
+    expected: &'static str,
+) -> Result<(), ProtocolError> {
+    if actual != expected {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("must equal {expected:?}"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceRequest {
+    pub workbench: WorkbenchName,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetWorkspaceRequest {
+    pub workbench: WorkbenchName,
+}
+
+impl GetWorkspaceRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+impl CreateWorkspaceRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetPathRequest {
+    pub target: WorkspacePath,
+    pub view: WorkspaceReadView,
+    pub expected_read_version: Option<u64>,
+    pub range: Option<ByteRange>,
+    pub plan_page: Option<PageRequest>,
+    pub if_none_match: Option<u64>,
+}
+
+impl GetPathRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.view.validate("get_path.view")?;
+        if self.expected_read_version == Some(0) {
+            return Err(ProtocolError::invalid(
+                "get_path.expected_read_version",
+                "must be greater than zero",
+            ));
+        }
+        match (self.range, self.plan_page.as_ref()) {
+            (None, None) => {}
+            (Some(range), Some(page)) => {
+                range.validate()?;
+                page.validate("get_path.plan_page")?;
+                if page.limit as usize > crate::MAX_ARTIFACT_READ_PLAN_ROWS {
+                    return Err(ProtocolError::invalid(
+                        "get_path.plan_page.limit",
+                        format!("exceeds {}", crate::MAX_ARTIFACT_READ_PLAN_ROWS),
+                    ));
+                }
+            }
+            (None, Some(_)) => {
+                return Err(ProtocolError::invalid(
+                    "get_path.plan_page",
+                    "metadata-only reads must not include a plan page",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(ProtocolError::invalid(
+                    "get_path.plan_page",
+                    "ranged reads require an explicit plan page",
+                ));
+            }
+        }
+        if self.if_none_match == Some(0) {
+            return Err(ProtocolError::invalid(
+                "get_path.if_none_match",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// Stable target-workspace state that authorizes a live page continuation at a
+/// newer root read version.
+pub struct WorkspaceContinuationFence {
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub workspace_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListPathsRequest {
+    pub workbench: WorkbenchName,
+    pub prefix: Option<crate::types::RelativePath>,
+    pub recursive: bool,
+    pub view: WorkspaceReadView,
+    pub expected_read_version: Option<u64>,
+    pub workspace_continuation_fence: Option<WorkspaceContinuationFence>,
+    pub page: PageRequest,
+}
+
+impl ListPathsRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.view.validate("list_paths.view")?;
+        if self.expected_read_version == Some(0) {
+            return Err(ProtocolError::invalid(
+                "list_paths.expected_read_version",
+                "must be greater than zero",
+            ));
+        }
+        if self.expected_read_version.is_some() && self.workspace_continuation_fence.is_some() {
+            return Err(ProtocolError::invalid(
+                "list_paths.workspace_continuation_fence",
+                "must not be combined with expected_read_version",
+            ));
+        }
+        if matches!(self.view, WorkspaceReadView::Snapshot(_))
+            && self.workspace_continuation_fence.is_some()
+        {
+            return Err(ProtocolError::invalid(
+                "list_paths.workspace_continuation_fence",
+                "is only valid for live workspace reads",
+            ));
+        }
+        if self.page.cursor.is_some()
+            && self.expected_read_version.is_none()
+            && self.workspace_continuation_fence.is_none()
+        {
+            return Err(ProtocolError::invalid(
+                "list_paths.expected_read_version",
+                "or workspace_continuation_fence is required when continuing from a page cursor",
+            ));
+        }
+        self.page.validate("list_paths.page")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemovePathRequest {
+    pub target: WorkspacePath,
+    pub expected_generation: u64,
+}
+
+/// One generation-fenced, create-only move inside one Workbench incarnation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenamePathRequest {
+    pub source: WorkspacePath,
+    pub destination: WorkspacePath,
+    pub expected_generation: u64,
+}
+
+impl RenamePathRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source.workbench != self.destination.workbench {
+            return Err(ProtocolError::invalid(
+                "rename_path.destination.workbench",
+                "must equal source.workbench",
+            ));
+        }
+        if self.source.path == self.destination.path {
+            return Err(ProtocolError::invalid(
+                "rename_path.destination.path",
+                "must differ from source.path",
+            ));
+        }
+        if self.expected_generation == 0 {
+            return Err(ProtocolError::invalid(
+                "rename_path.expected_generation",
+                "must be greater than zero",
+            ));
+        }
+        for (field, path) in [
+            ("rename_path.source.path", &self.source.path),
+            ("rename_path.destination.path", &self.destination.path),
+        ] {
+            if matches!(
+                path.as_str(),
+                "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+            ) {
+                return Err(ProtocolError::invalid(
+                    field,
+                    "canonical Workbench manifests are lifecycle-owned and cannot be renamed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RemovePathRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.expected_generation == 0 {
+            return Err(ProtocolError::invalid(
+                "remove_path.expected_generation",
+                "must be greater than zero",
+            ));
+        }
+        if matches!(
+            self.target.path.as_str(),
+            "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+        ) {
+            return Err(ProtocolError::invalid(
+                "remove_path.target.path",
+                "canonical Workbench manifests are lifecycle-owned and cannot be removed directly",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BeginArtifactPublishRequest {
+    /// Logical append identity and monotonic attempt owning this publication.
+    pub append_attempt: Option<crate::AppendAttemptBinding>,
+    /// Exact caller intent for a stable append; binds one publication attempt.
+    pub append_intent_digest: Option<Digest>,
+    pub operation_id: OperationIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+    pub target: WorkspacePath,
+    pub authority: PublicationAuthority,
+    pub condition: PublishCondition,
+    /// Optional fence: the exact workspace incarnation the caller bound its
+    /// durable state to. The owner evaluates it on the same read version as
+    /// the path generation claim and refuses the publish before any durable
+    /// row exists when the workbench is a different incarnation. Only legal
+    /// with `PublicationAuthority::Visible`; staging authorities carry their
+    /// own incarnation binding. Omitted from the wire when `None`, so a request
+    /// without a fence encodes exactly as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_workspace_incarnation_id: Option<WorkspaceIdentity>,
+    pub staged_object_count: u32,
+    pub staged_object_seal: Digest,
+    pub manifest_row_count: u32,
+    pub manifest_seal: Digest,
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+    /// SHA-256 of a body this publication stores inline instead of objects.
+    /// Only `PublishInlineArtifact` admits it, together with that body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_body_digest: Option<Digest>,
+}
+
+impl BeginArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.condition.validate()?;
+        if self.append_attempt.is_some() != self.append_intent_digest.is_some() {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "attempt binding and intent digest must be supplied together",
+            ));
+        }
+        if self
+            .append_attempt
+            .is_some_and(|binding| binding.operation_id == self.operation_id)
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_attempt",
+                "logical and publication identities must differ",
+            ));
+        }
+        if self.append_intent_digest.is_some()
+            && (!matches!(self.authority, PublicationAuthority::Visible)
+                || self.expected_workspace_incarnation_id.is_none()
+                || !matches!(
+                    self.condition,
+                    PublishCondition::CreateOnly
+                        | PublishCondition::Append {
+                            expected_generation: Some(_)
+                        }
+                ))
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.append_intent_digest",
+                "stable append requires visible authority, an incarnation fence, and create-only or generation-bound append",
+            ));
+        }
+        if self.expected_workspace_incarnation_id.is_some()
+            && !matches!(self.authority, PublicationAuthority::Visible)
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.expected_workspace_incarnation_id",
+                "an expected workspace incarnation fence applies only to visible publication",
+            ));
+        }
+        match self.authority {
+            PublicationAuthority::Visible => {
+                if matches!(
+                    self.target.path.as_str(),
+                    "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+                ) {
+                    return Err(ProtocolError::invalid(
+                        "begin_artifact_publish.authority",
+                        "canonical Workbench manifests require their lifecycle-owned staging authority",
+                    ));
+                }
+            }
+            PublicationAuthority::CommitStaging { .. } => {
+                if self.target.path.as_str() != "metadata/run_manifest.json"
+                    || matches!(self.condition, PublishCondition::Append { .. })
+                    || !self.dependency_owner_revision_ids.is_empty()
+                {
+                    return Err(ProtocolError::invalid(
+                        "begin_artifact_publish.authority",
+                        "commit staging may only create or replace one dependency-free metadata/run_manifest.json",
+                    ));
+                }
+            }
+            PublicationAuthority::RestoreStaging { .. } => {
+                if !matches!(
+                    self.target.path.as_str(),
+                    "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+                ) || !matches!(self.condition, PublishCondition::CreateOnly)
+                    || !self.dependency_owner_revision_ids.is_empty()
+                {
+                    return Err(ProtocolError::invalid(
+                        "begin_artifact_publish.authority",
+                        "restore staging may only create dependency-free metadata/run_manifest.json and metadata/restore_manifest.json",
+                    ));
+                }
+            }
+        }
+        if self.staged_object_count as usize > MAX_ARTIFACT_PUBLISH_OBJECTS {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.staged_object_count",
+                format!("exceeds {MAX_ARTIFACT_PUBLISH_OBJECTS}"),
+            ));
+        }
+        if self.manifest_row_count as usize > MAX_ARTIFACT_PUBLISH_OBJECTS {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.manifest_row_count",
+                format!("exceeds {MAX_ARTIFACT_PUBLISH_OBJECTS}"),
+            ));
+        }
+        validate_dependency_owners(
+            "begin_artifact_publish.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )?;
+        if self
+            .dependency_owner_revision_ids
+            .binary_search(&self.artifact_revision_id)
+            .is_ok()
+        {
+            return Err(ProtocolError::invalid(
+                "begin_artifact_publish.dependency_owner_revision_ids",
+                "must not contain the new artifact revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Stepwise and fused object publications seal no inline body: a body only
+/// travels with the one request that also completes it.
+fn require_object_backed_begin(
+    field: &'static str,
+    begin: &BeginArtifactPublishRequest,
+) -> Result<(), ProtocolError> {
+    if begin.inline_body_digest.is_some() {
+        return Err(ProtocolError::invalid(
+            field,
+            "an inline body digest is admitted only by PublishInlineArtifact",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StageArtifactObjectsRequest {
+    pub token: OperationToken,
+    pub objects: Vec<StagedObject>,
+}
+
+impl StageArtifactObjectsRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_staged_objects("stage_artifact_objects.objects", &self.objects)
+    }
+}
+
+/// One staged object's bytes, written to the object store by the owner.
+///
+/// The owner checks the body against the staged object's sealed length and
+/// digest, creates the immutable object with its own credentials, and records
+/// the upload; a client never writes an object itself. The sequence must be
+/// the next one the publication has not recorded. An exact retry of a block
+/// the owner already wrote replays, because the store accepts the same bytes
+/// at the same key.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UploadArtifactObjectRequest {
+    pub token: OperationToken,
+    pub sequence: u32,
+    #[serde(with = "crate::artifact_publish::wire_bytes")]
+    pub body: Vec<u8>,
+}
+
+impl UploadArtifactObjectRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.body.is_empty() {
+            return Err(ProtocolError::invalid(
+                "upload_artifact_object.body",
+                "must not be empty",
+            ));
+        }
+        if self.body.len() > MAX_ARTIFACT_UPLOAD_BODY_BYTES {
+            return Err(ProtocolError::invalid(
+                "upload_artifact_object.body",
+                format!("exceeds {MAX_ARTIFACT_UPLOAD_BODY_BYTES} bytes"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StageArtifactManifestRequest {
+    pub token: OperationToken,
+    pub rows: Vec<ArtifactManifestRow>,
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+}
+
+impl StageArtifactManifestRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_manifest_rows("stage_artifact_manifest.rows", &self.rows)?;
+        validate_dependency_owners(
+            "stage_artifact_manifest.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteArtifactPublishRequest {
+    pub token: OperationToken,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl CompleteArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.artifact.validate()
+    }
+}
+
+/// `BeginArtifactPublish` and, for a fresh publication, staging its complete
+/// object plan in the same write session, so the publication is durable before
+/// any provider write after one acknowledgement. A publication that already
+/// made progress answers with its `Begin` status unchanged and the caller
+/// resumes it step by step.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareArtifactPublishRequest {
+    pub begin: BeginArtifactPublishRequest,
+    /// The complete staged-object plan sealed by `begin`.
+    pub objects: Vec<StagedObject>,
+}
+
+impl PrepareArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        require_object_backed_begin("prepare_artifact_publish.begin", &self.begin)?;
+        self.begin.validate()?;
+        if self.objects.len() != self.begin.staged_object_count as usize {
+            return Err(ProtocolError::invalid(
+                "prepare_artifact_publish.objects",
+                "must carry the complete staged-object plan",
+            ));
+        }
+        if self.objects.is_empty() {
+            return Ok(());
+        }
+        validate_staged_objects("prepare_artifact_publish.objects", &self.objects)
+    }
+}
+
+/// Staging the remaining manifest rows and completing the publication in one
+/// write session, with one acknowledgement after the owner wrote every staged
+/// object. Each step keeps the replay, heartbeat, and token rules of its
+/// stepwise request.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinishArtifactPublishRequest {
+    pub token: OperationToken,
+    pub manifest_rows: Vec<ArtifactManifestRow>,
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionIdentity>,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl FinishArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if !self.manifest_rows.is_empty() {
+            validate_manifest_rows("finish_artifact_publish.manifest_rows", &self.manifest_rows)?;
+        }
+        validate_dependency_owners(
+            "finish_artifact_publish.dependency_owner_revision_ids",
+            &self.dependency_owner_revision_ids,
+        )?;
+        self.artifact.validate()
+    }
+}
+
+/// Admit and complete a publication whose whole body travels in this request
+/// and is stored inline in shard metadata, in one write session with one
+/// durable acknowledgement.
+///
+/// No object is written, so no durable intent has to precede one: `begin`
+/// seals no staged objects and no manifest rows, and binds the body's SHA-256
+/// as its inline body digest. Each step keeps the replay, token, and recovery
+/// rules of its stepwise request; a publication found in progress is
+/// completed with this body.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishInlineArtifactRequest {
+    pub begin: BeginArtifactPublishRequest,
+    #[serde(with = "crate::artifact_publish::wire_bytes")]
+    pub body: Vec<u8>,
+    pub artifact: ArtifactDescriptor,
+}
+
+impl PublishInlineArtifactRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.begin.validate()?;
+        self.artifact.validate()?;
+        if !matches!(self.begin.authority, PublicationAuthority::Visible) {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin.authority",
+                "inline bodies are published only under visible authority",
+            ));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_INLINE_ARTIFACT_BODY_BYTES {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.body",
+                format!("must hold 1 to {MAX_INLINE_ARTIFACT_BODY_BYTES} bytes"),
+            ));
+        }
+        let empty_closure = Digest([0; 32]);
+        if self.begin.staged_object_count != 0
+            || self.begin.staged_object_seal != empty_closure
+            || self.begin.manifest_row_count != 0
+            || self.begin.manifest_seal != empty_closure
+            || !self.begin.dependency_owner_revision_ids.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact.begin",
+                "an inline publication stages no objects, manifest rows, or dependencies",
+            ));
+        }
+        let digest = inline_artifact_body_digest(&self.body);
+        if self.begin.inline_body_digest != Some(digest)
+            || self.artifact.body_digest != sha256_digest_uri(digest)
+            || self.artifact.manifest_digest != sha256_digest_uri(empty_closure)
+            || self.artifact.logical_size != self.body.len() as u64
+        {
+            return Err(ProtocolError::invalid(
+                "publish_inline_artifact",
+                "the sealed plan and descriptor must describe exactly this body",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AbortArtifactPublishRequest {
+    pub token: OperationToken,
+    pub reason: String,
+}
+
+impl AbortArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_required_text("abort_artifact_publish.reason", &self.reason, 1_024)
+    }
+}
+
+/// Operator verdict about provider-side object state for one quarantined
+/// artifact publication. The operator must verify at the provider before
+/// calling; the server atomically enforces the machine-checkable half of the
+/// verdict and refuses on contradiction.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineResolution {
+    /// Every staged provider key was verified absent and the artifact
+    /// revision was never published; the revision identity is released for a
+    /// fresh publication.
+    ProviderObjectsAbsent,
+    /// The artifact revision is already published; staged provider keys are
+    /// the published revision's live objects and only this operation's
+    /// private bookkeeping rows are removed.
+    RevisionPublished,
+}
+
+/// Operator reconciliation of one quarantined artifact publication.
+///
+/// The token must digest the exact quarantined operation state the operator
+/// inspected, so a concurrent change invalidates the verdict.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileQuarantinedArtifactPublishRequest {
+    pub token: OperationToken,
+    pub resolution: QuarantineResolution,
+    /// Audit reason durably retained in the resolved operation.
+    pub reason: String,
+    /// Digest of the operator's provider verification transcript, durably
+    /// bound into the resolved operation's evidence chain.
+    pub evidence_digest: Digest,
+}
+
+impl ReconcileQuarantinedArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_required_text(
+            "reconcile_quarantined_artifact_publish.reason",
+            &self.reason,
+            1_024,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommitRequest {
+    pub operation_id: OperationIdentity,
+    pub workbench: WorkbenchName,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub commit_id: CommitIdentity,
+    pub content_digest: DigestUri,
+    pub manifest_digest: DigestUri,
+    /// Domain-separated digest of every Agent run-manifest projection input
+    /// except the first owner-observed durable timestamp. This authenticates
+    /// recovery before an immutable manifest revision exists.
+    pub projection_input_digest: Digest,
+    pub tree_manifest_revision_id: ArtifactRevisionIdentity,
+    /// Original Agent authorization for replacing an existing commit head.
+    /// This is durable request identity, not a hint that may be recomputed on
+    /// retry from the current head.
+    pub replace: bool,
+    /// Exact frozen claim for publishing `metadata/run_manifest.json`.
+    pub run_manifest_condition: PublishCondition,
+    pub expected_head_generation: Option<u64>,
+    pub parents: Vec<CommitIdentity>,
+    pub producer: Option<String>,
+    pub lineage_projection: Vec<u8>,
+}
+
+impl CommitRequest {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
+        self.run_manifest_condition.validate()?;
+        if matches!(self.run_manifest_condition, PublishCondition::Append { .. }) {
+            return Err(ProtocolError::invalid(
+                "commit.run_manifest_condition",
+                "commit run-manifest publication does not support append",
+            ));
+        }
+        if self.expected_head_generation == Some(0) {
+            return Err(ProtocolError::invalid(
+                "commit.expected_head_generation",
+                "must be greater than zero",
+            ));
+        }
+        if self.parents.len() > MAX_PARENT_COMMITS {
+            return Err(ProtocolError::invalid(
+                "commit.parents",
+                format!("exceeds {MAX_PARENT_COMMITS}"),
+            ));
+        }
+        if !self.parents.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(ProtocolError::invalid(
+                "commit.parents",
+                "must be sorted and unique",
+            ));
+        }
+        validate_optional_text("commit.producer", self.producer.as_deref(), 512)?;
+        if self.lineage_projection.len() > 64 * 1_024 {
+            return Err(ProtocolError::invalid(
+                "commit.lineage_projection",
+                "exceeds 65536 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetSnapshotRequest {
+    pub workbench: WorkbenchName,
+    pub selector: SnapshotSelector,
+}
+
+impl GetSnapshotRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.selector.validate("get_snapshot.selector")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MintSnapshotRequest {
+    pub workbench: WorkbenchName,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub snapshot_id: u64,
+    pub lease_deadline_ms: u64,
+    pub alias: Option<SnapshotAlias>,
+    pub annotation: Vec<u8>,
+}
+
+impl MintSnapshotRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.snapshot_id == 0 {
+            return Err(ProtocolError::invalid(
+                "mint_snapshot.snapshot_id",
+                "must be greater than zero",
+            ));
+        }
+        if self.lease_deadline_ms == 0 {
+            return Err(ProtocolError::invalid(
+                "mint_snapshot.lease_deadline_ms",
+                "must be greater than zero",
+            ));
+        }
+        if self.annotation.len() > 4_096 {
+            return Err(ProtocolError::invalid(
+                "mint_snapshot.annotation",
+                "exceeds 4096 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenewSnapshotRequest {
+    pub workbench: WorkbenchName,
+    pub selector: SnapshotSelector,
+    pub lease_deadline_ms: u64,
+}
+
+impl RenewSnapshotRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.selector.validate("renew_snapshot.selector")?;
+        if self.lease_deadline_ms == 0 {
+            return Err(ProtocolError::invalid(
+                "renew_snapshot.lease_deadline_ms",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetireSnapshotRequest {
+    pub workbench: WorkbenchName,
+    pub selector: SnapshotSelector,
+    pub retire_annotation: Option<Vec<u8>>,
+}
+
+impl RetireSnapshotRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.selector.validate("retire_snapshot.selector")?;
+        if self
+            .retire_annotation
+            .as_ref()
+            .is_some_and(|annotation| annotation.len() > 4_096)
+        {
+            return Err(ProtocolError::invalid(
+                "retire_snapshot.retire_annotation",
+                "exceeds 4096 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListSnapshotsRequest {
+    pub workbench: WorkbenchName,
+    pub page: PageRequest,
+}
+
+impl ListSnapshotsRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.page.validate("list_snapshots.page")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreSource {
+    Snapshot(SnapshotSelector),
+    Commit(CommitIdentity),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreManifestDescriptor {
+    pub body_digest: DigestUri,
+    pub logical_size: u64,
+    pub content_type: crate::types::ContentType,
+}
+
+impl RestoreManifestDescriptor {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.body_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "prepare_restore.restore_manifest.body_digest",
+                error.to_string(),
+            )
+        })?;
+        if !(1..=MAX_RESTORE_MANIFEST_BYTES).contains(&self.logical_size) {
+            return Err(ProtocolError::invalid(
+                "prepare_restore.restore_manifest.logical_size",
+                format!("must be between 1 and {MAX_RESTORE_MANIFEST_BYTES}"),
+            ));
+        }
+        if self.content_type.as_str() != "application/json" {
+            return Err(ProtocolError::invalid(
+                "prepare_restore.restore_manifest.content_type",
+                "must equal application/json",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable publication identities reserved for one destination manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreManifestIdentity {
+    pub publication_operation_id: OperationIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareRestoreRequest {
+    pub operation_id: OperationIdentity,
+    pub source_workbench: WorkbenchName,
+    pub source_workspace_incarnation_id: WorkspaceIdentity,
+    pub source: RestoreSource,
+    pub destination_workbench: WorkbenchName,
+    pub destination_workspace_incarnation_id: WorkspaceIdentity,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
+    pub restore_manifest: RestoreManifestDescriptor,
+}
+
+impl PrepareRestoreRequest {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source_workbench == self.destination_workbench {
+            return Err(ProtocolError::invalid(
+                "prepare_restore.destination_workbench",
+                "must differ from source workbench",
+            ));
+        }
+        if let RestoreSource::Snapshot(selector) = &self.source {
+            selector.validate("prepare_restore.source")?;
+            if matches!(selector, SnapshotSelector::Alias(_)) {
+                return Err(ProtocolError::invalid(
+                    "prepare_restore.source",
+                    "must use a concrete snapshot id",
+                ));
+            }
+        }
+        if self.operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "prepare_restore.destination_restore_manifest_identity",
+                "restore and manifest publication operations must be distinct",
+            ));
+        }
+        self.restore_manifest.validate()
+    }
+}
+
+/// Late-bind the destination commit after the exact materialized source
+/// closure has been sealed by the restore operation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindRestoreDestinationRequest {
+    pub operation_id: OperationIdentity,
+    pub destination_commit_id: CommitIdentity,
+    pub effective_content_digest: DigestUri,
+    pub destination_run_manifest_projection_input_digest: Digest,
+    pub destination_run_manifest_identity: RestoreManifestIdentity,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
+}
+
+impl BindRestoreDestinationRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.effective_content_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "bind_restore_destination.effective_content_digest",
+                error.to_string(),
+            )
+        })?;
+        if self.destination_run_manifest_projection_input_digest == Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_run_manifest_projection_input_digest",
+                "must not be the zero digest",
+            ));
+        }
+        if self
+            .destination_run_manifest_identity
+            .publication_operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+            || self.destination_run_manifest_identity.artifact_revision_id
+                == self
+                    .destination_restore_manifest_identity
+                    .artifact_revision_id
+        {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_manifests",
+                "run and restore manifests require distinct publication operations and artifact revisions",
+            ));
+        }
+        if self.operation_id
+            == self
+                .destination_run_manifest_identity
+                .publication_operation_id
+            || self.operation_id
+                == self
+                    .destination_restore_manifest_identity
+                    .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_manifests",
+                "restore and manifest publication operations must be distinct",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read the exact source commit-owned run manifest bound to one restore.
+///
+/// The operation identity provides the durable source binding; callers cannot
+/// substitute a path or read view.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadRestoreSourceRunManifestRequest {
+    pub operation_id: OperationIdentity,
+    pub range: Option<ByteRange>,
+    pub plan_page: Option<PageRequest>,
+}
+
+impl ReadRestoreSourceRunManifestRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match (self.range, self.plan_page.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(range), Some(page)) => {
+                range.validate()?;
+                page.validate("read_restore_source_run_manifest.plan_page")?;
+                if page.limit as usize > crate::MAX_ARTIFACT_READ_PLAN_ROWS {
+                    return Err(ProtocolError::invalid(
+                        "read_restore_source_run_manifest.plan_page.limit",
+                        format!("exceeds {}", crate::MAX_ARTIFACT_READ_PLAN_ROWS),
+                    ));
+                }
+                Ok(())
+            }
+            (None, Some(_)) => Err(ProtocolError::invalid(
+                "read_restore_source_run_manifest.plan_page",
+                "metadata-only reads must not include a plan page",
+            )),
+            (Some(_), None) => Err(ProtocolError::invalid(
+                "read_restore_source_run_manifest.plan_page",
+                "ranged reads require an explicit plan page",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeRestoreRequest {
+    pub operation_id: OperationIdentity,
+}
+
+impl FinalizeRestoreRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetOperationRequest {
+    pub operation_id: OperationIdentity,
+}
+
+impl GetOperationRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+/// Declared predicate, ordering, and facet behavior for one Generic custom
+/// field. Declarations are immutable for one generation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexFieldCapability {
+    pub field_id: String,
+    pub operators: Vec<QueryOperator>,
+    pub sortable: bool,
+    pub facetable: bool,
+}
+
+impl GenericIndexFieldCapability {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_generic_index_field_id("generic_index.capability.field_id", &self.field_id)?;
+        if self.operators.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ProtocolError::invalid(
+                "generic_index.capability.operators",
+                "must be strictly sorted in canonical order without duplicates",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ordered, duplicate-preserving values for one Generic custom field.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexFieldValues {
+    pub field_id: String,
+    pub values: Vec<ScalarValue>,
+}
+
+impl GenericIndexFieldValues {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_at("generic_index.field_values")
+    }
+
+    pub(crate) fn validate_at(&self, field: &'static str) -> Result<(), ProtocolError> {
+        validate_generic_index_field_id(field, &self.field_id)?;
+        if self.values.is_empty() || self.values.len() > MAX_GENERIC_INDEX_VALUES_PER_FIELD {
+            return Err(ProtocolError::invalid(
+                field,
+                format!("must contain between 1 and {MAX_GENERIC_INDEX_VALUES_PER_FIELD} values"),
+            ));
+        }
+        for value in &self.values {
+            value.validate()?;
+            if !matches!(
+                value,
+                ScalarValue::String(_) | ScalarValue::Unsigned(_) | ScalarValue::Decimal(_)
+            ) {
+                return Err(ProtocolError::invalid(
+                    field,
+                    "Generic custom indexes support only string, unsigned, and finite decimal values",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One registration row relative to the exact index path. `None` denotes the
+/// registration root; field groups are canonical while values retain caller
+/// order and duplicates.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexRow {
+    pub relative_path: Option<crate::RelativePath>,
+    pub values: Vec<GenericIndexFieldValues>,
+}
+
+impl GenericIndexRow {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.values.len() > MAX_GENERIC_INDEX_ROW_FIELDS {
+            return Err(ProtocolError::invalid(
+                "generic_index.row.values",
+                format!("exceeds {MAX_GENERIC_INDEX_ROW_FIELDS} fields"),
+            ));
+        }
+        for values in &self.values {
+            values.validate_at("generic_index.row.values")?;
+        }
+        if self
+            .values
+            .windows(2)
+            .any(|pair| pair[0].field_id >= pair[1].field_id)
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.row.values",
+                "must be strictly sorted by field_id without duplicates",
+            ));
+        }
+        // Match the durable row envelope before Begin can leave a staging
+        // operation that no later append can materialize. Binding uses the
+        // largest exact-artifact form because the frozen source decides it.
+        let mut encoded_size = 1_usize + 1 + 16 + 8 + 2;
+        if let Some(path) = &self.relative_path {
+            encoded_size = encoded_size
+                .checked_add(4 + path.as_str().len())
+                .ok_or_else(|| {
+                    ProtocolError::invalid("generic_index.row", "encoded size overflows")
+                })?;
+        }
+        for field in &self.values {
+            encoded_size = encoded_size
+                .checked_add(2 + field.field_id.len() + 2)
+                .ok_or_else(|| {
+                    ProtocolError::invalid("generic_index.row", "encoded size overflows")
+                })?;
+            for value in &field.values {
+                let scalar_size = match value {
+                    ScalarValue::String(value) => 1 + 4 + value.len(),
+                    ScalarValue::Unsigned(_) | ScalarValue::Decimal(_) => 1 + 8,
+                    _ => unreachable!("Generic scalar validation rejected this variant"),
+                };
+                encoded_size = encoded_size.checked_add(scalar_size).ok_or_else(|| {
+                    ProtocolError::invalid("generic_index.row", "encoded size overflows")
+                })?;
+            }
+        }
+        if encoded_size > MAX_GENERIC_INDEX_ROW_BYTES {
+            return Err(ProtocolError::invalid(
+                "generic_index.row",
+                format!(
+                    "encoded payload is {encoded_size} bytes, maximum is {MAX_GENERIC_INDEX_ROW_BYTES}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Begin a recoverable registration against one frozen visible workspace and
+/// an exact current-pointer condition.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BeginGenericIndexRegistrationRequest {
+    pub operation_id: OperationIdentity,
+    pub generation_id: GenericIndexGenerationIdentity,
+    pub workbench: WorkbenchName,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    /// `None` registers the exact Workbench root.
+    pub index_path: Option<crate::RelativePath>,
+    /// `None` is create-only; `Some` is an exact current-pointer CAS.
+    pub expected_current_generation: Option<u64>,
+    pub capabilities: Vec<GenericIndexFieldCapability>,
+    pub declared_row_count: u64,
+}
+
+impl BeginGenericIndexRegistrationRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if let Some(generation) = self.expected_current_generation {
+            crate::types::require_generation(
+                "generic_index.expected_current_generation",
+                generation,
+            )?;
+            generation.checked_add(1).ok_or_else(|| {
+                ProtocolError::invalid(
+                    "generic_index.expected_current_generation",
+                    "cannot advance beyond u64::MAX",
+                )
+            })?;
+        }
+        if self.capabilities.len() > MAX_GENERIC_INDEX_FIELDS {
+            return Err(ProtocolError::invalid(
+                "generic_index.capabilities",
+                format!("exceeds {MAX_GENERIC_INDEX_FIELDS} fields"),
+            ));
+        }
+        for capability in &self.capabilities {
+            capability.validate()?;
+        }
+        if self
+            .capabilities
+            .windows(2)
+            .any(|pair| pair[0].field_id >= pair[1].field_id)
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.capabilities",
+                "must be strictly sorted by field_id without duplicates",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Append one contiguous, strictly path-ordered batch to a building Generic
+/// custom-index generation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppendGenericIndexRowsRequest {
+    pub operation_id: OperationIdentity,
+    pub first_sequence: u64,
+    pub rows: Vec<GenericIndexRow>,
+}
+
+impl AppendGenericIndexRowsRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.rows.is_empty() || self.rows.len() > MAX_GENERIC_INDEX_APPEND_ROWS {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.rows",
+                format!("must contain between 1 and {MAX_GENERIC_INDEX_APPEND_ROWS} rows"),
+            ));
+        }
+        self.first_sequence
+            .checked_add(self.rows.len() as u64)
+            .ok_or_else(|| {
+                ProtocolError::invalid("generic_index.append.first_sequence", "range overflows")
+            })?;
+        for row in &self.rows {
+            row.validate()?;
+        }
+        if self
+            .rows
+            .windows(2)
+            .any(|pair| pair[0].relative_path >= pair[1].relative_path)
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.rows",
+                "must be strictly ordered and unique by relative_path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeGenericIndexRegistrationRequest {
+    pub operation_id: OperationIdentity,
+}
+
+impl FinalizeGenericIndexRegistrationRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AbortGenericIndexRegistrationRequest {
+    pub operation_id: OperationIdentity,
+    pub limit: u32,
+}
+
+impl AbortGenericIndexRegistrationRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if !(1..=MAX_GENERIC_INDEX_ABORT_ROWS).contains(&self.limit) {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.limit",
+                format!("must be between 1 and {MAX_GENERIC_INDEX_ABORT_ROWS}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GetGenericIndexRegistrationRequest {
+    pub operation_id: OperationIdentity,
+}
+
+impl GetGenericIndexRegistrationRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryScope {
+    Root {
+        path_prefix: Option<crate::types::RelativePath>,
+    },
+    Workspace {
+        workbench: WorkbenchName,
+        path_prefix: Option<crate::types::RelativePath>,
+    },
+}
+
+impl QueryScope {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryOperator {
+    Equal,
+    NotEqual,
+    In,
+    Prefix,
+    Suffix,
+    Contains,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+    Exists,
+    NotExists,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum QueryOperand {
+    None,
+    Scalar(ScalarValue),
+    Set(Vec<ScalarValue>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QueryPredicate {
+    pub field_id: String,
+    pub operator: QueryOperator,
+    pub operand: QueryOperand,
+}
+
+impl QueryPredicate {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_field_id("query_predicate.field_id", &self.field_id)?;
+        match (self.operator, &self.operand) {
+            (QueryOperator::Exists | QueryOperator::NotExists, QueryOperand::None) => Ok(()),
+            (QueryOperator::In, QueryOperand::Set(values)) => {
+                if values.len() > MAX_QUERY_IN_VALUES {
+                    return Err(ProtocolError::invalid(
+                        "query_predicate.operand",
+                        format!("set exceeds {MAX_QUERY_IN_VALUES} values"),
+                    ));
+                }
+                for (index, value) in values.iter().enumerate() {
+                    value.validate()?;
+                    if values[..index].contains(value) {
+                        return Err(ProtocolError::invalid(
+                            "query_predicate.operand",
+                            "set values must be distinct",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            (
+                QueryOperator::Equal
+                | QueryOperator::NotEqual
+                | QueryOperator::Less
+                | QueryOperator::LessOrEqual
+                | QueryOperator::Greater
+                | QueryOperator::GreaterOrEqual
+                | QueryOperator::Prefix
+                | QueryOperator::Suffix
+                | QueryOperator::Contains,
+                QueryOperand::Scalar(value),
+            ) => value.validate(),
+            (QueryOperator::Exists | QueryOperator::NotExists, _) => Err(ProtocolError::invalid(
+                "query_predicate.operand",
+                "existence operators require the no-value operand",
+            )),
+            (QueryOperator::In, _) => Err(ProtocolError::invalid(
+                "query_predicate.operand",
+                "in requires a set operand",
+            )),
+            (_, _) => Err(ProtocolError::invalid(
+                "query_predicate.operand",
+                "comparison operator requires one scalar operand",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Explicit query row and capability contract. New profiles require a wire
+/// schema bump; servers never infer one from field names.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryProfile {
+    ArtifactV1,
+    GenericCustomIndexV1 { presentation_path_root: String },
+}
+
+impl QueryProfile {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        let Self::GenericCustomIndexV1 {
+            presentation_path_root,
+        } = self
+        else {
+            return Ok(());
+        };
+        validate_presentation_path_root(presentation_path_root).map_err(|reason| {
+            ProtocolError::invalid("query_profile.presentation_path_root", reason)
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SortField {
+    pub field_id: String,
+    pub direction: SortDirection,
+}
+
+impl SortField {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_field_id("sort.field_id", &self.field_id)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SearchRequest {
+    pub profile: QueryProfile,
+    pub scope: QueryScope,
+    pub predicates: Vec<QueryPredicate>,
+    pub projection: Vec<String>,
+    pub sort: Vec<SortField>,
+    pub facets: Vec<String>,
+    pub page: PageRequest,
+}
+
+impl SearchRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.profile.validate()?;
+        self.scope.validate()?;
+        if self.predicates.len() > MAX_QUERY_PREDICATES {
+            return Err(ProtocolError::invalid(
+                "search.predicates",
+                format!("exceeds {MAX_QUERY_PREDICATES}"),
+            ));
+        }
+        for predicate in &self.predicates {
+            predicate.validate()?;
+        }
+        validate_field_ids("search.projection", &self.projection, MAX_QUERY_FIELDS)?;
+        if self.sort.len() > MAX_SORT_FIELDS {
+            return Err(ProtocolError::invalid(
+                "search.sort",
+                format!("exceeds {MAX_SORT_FIELDS}"),
+            ));
+        }
+        for sort in &self.sort {
+            sort.validate()?;
+        }
+        validate_field_ids("search.facets", &self.facets, MAX_FACET_FIELDS)?;
+        validate_page_within(&self.page, "search.page", MAX_QUERY_PAGE_LIMIT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Average,
+    Minimum,
+    Maximum,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateSpec {
+    pub function: AggregateFunction,
+    pub field_id: Option<String>,
+    pub result_id: String,
+}
+
+impl AggregateSpec {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_field_id("aggregate.result_id", &self.result_id)?;
+        match (self.function, self.field_id.as_deref()) {
+            (AggregateFunction::Count, None) => Ok(()),
+            (AggregateFunction::Count, Some(field)) => {
+                validate_field_id("aggregate.field_id", field)
+            }
+            (_, Some(field)) => validate_field_id("aggregate.field_id", field),
+            (_, None) => Err(ProtocolError::invalid(
+                "aggregate.field_id",
+                "is required for this function",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateRequest {
+    pub profile: QueryProfile,
+    pub scope: QueryScope,
+    pub predicates: Vec<QueryPredicate>,
+    pub group_by: Vec<String>,
+    pub aggregates: Vec<AggregateSpec>,
+    pub sort: Vec<SortField>,
+    pub page: PageRequest,
+}
+
+impl AggregateRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.profile.validate()?;
+        self.scope.validate()?;
+        if self.predicates.len() > MAX_QUERY_PREDICATES {
+            return Err(ProtocolError::invalid(
+                "aggregate.predicates",
+                format!("exceeds {MAX_QUERY_PREDICATES}"),
+            ));
+        }
+        for predicate in &self.predicates {
+            predicate.validate()?;
+        }
+        validate_field_ids("aggregate.group_by", &self.group_by, 8)?;
+        if self.aggregates.is_empty() || self.aggregates.len() > 16 {
+            return Err(ProtocolError::invalid(
+                "aggregate.aggregates",
+                "must contain between 1 and 16 specifications",
+            ));
+        }
+        for aggregate in &self.aggregates {
+            aggregate.validate()?;
+        }
+        if self.sort.len() > MAX_SORT_FIELDS {
+            return Err(ProtocolError::invalid(
+                "aggregate.sort",
+                format!("exceeds {MAX_SORT_FIELDS}"),
+            ));
+        }
+        for sort in &self.sort {
+            sort.validate()?;
+        }
+        validate_page_within(&self.page, "aggregate.page", MAX_QUERY_PAGE_LIMIT)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogRequest {
+    pub profile: QueryProfile,
+    pub scope: QueryScope,
+    pub path_match: CatalogPathMatch,
+    pub field_prefix: Option<String>,
+    pub include_facets: bool,
+    pub page: PageRequest,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogPathMatch {
+    Prefix,
+    Exact,
+}
+
+impl CatalogRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.profile.validate()?;
+        self.scope.validate()?;
+        if self.path_match == CatalogPathMatch::Exact
+            && matches!(
+                &self.scope,
+                QueryScope::Root { path_prefix: None }
+                    | QueryScope::Workspace {
+                        path_prefix: None,
+                        ..
+                    }
+            )
+        {
+            return Err(ProtocolError::invalid(
+                "catalog.path_match",
+                "exact matching requires a non-empty path prefix",
+            ));
+        }
+        if let Some(prefix) = self.field_prefix.as_deref() {
+            match &self.profile {
+                QueryProfile::ArtifactV1 => validate_field_id("catalog.field_prefix", prefix)?,
+                QueryProfile::GenericCustomIndexV1 { .. } => {
+                    validate_generic_catalog_field_prefix(prefix)?;
+                }
+            }
+        }
+        validate_page_within(&self.page, "catalog.page", MAX_QUERY_PAGE_LIMIT)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FindWorkspacesRequest {
+    pub committed_only: bool,
+    pub page: PageRequest,
+}
+
+impl FindWorkspacesRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_page_within(&self.page, "find_workspaces.page", MAX_QUERY_PAGE_LIMIT)
+    }
+}
+
+/// One page of the root's change feed: at most `MAX_CHANGE_PAGE_LIMIT`
+/// events, so a tailing reader bounds the owner's work under one read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePageRequest {
+    pub after_commit_version: Option<u64>,
+    pub workbench: Option<WorkbenchName>,
+    pub page: PageRequest,
+}
+
+impl ChangePageRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.after_commit_version == Some(0) {
+            return Err(ProtocolError::invalid(
+                "read_changes.after_commit_version",
+                "must be greater than zero",
+            ));
+        }
+        validate_page_within(&self.page, "read_changes.page", MAX_CHANGE_PAGE_LIMIT)
+    }
+}
+
+fn validate_page_within(
+    page: &PageRequest,
+    field: &'static str,
+    max_limit: u32,
+) -> Result<(), ProtocolError> {
+    if !(1..=max_limit).contains(&page.limit) {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("limit must be between 1 and {max_limit}"),
+        ));
+    }
+    page.validate(field)
+}
+
+fn validate_artifact_batch<T>(field: &'static str, rows: &[T]) -> Result<(), ProtocolError> {
+    if rows.is_empty() {
+        return Err(ProtocolError::invalid(field, "must not be empty"));
+    }
+    if rows.len() > MAX_ARTIFACT_PUBLISH_BATCH_ROWS {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("exceeds {MAX_ARTIFACT_PUBLISH_BATCH_ROWS} rows"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_staged_objects(
+    field: &'static str,
+    objects: &[StagedObject],
+) -> Result<(), ProtocolError> {
+    validate_artifact_batch(field, objects)?;
+    for object in objects {
+        object.validate()?;
+    }
+    require_strict_sequences(
+        field,
+        objects.iter().map(|object| u64::from(object.sequence)),
+    )
+}
+
+fn validate_manifest_rows(
+    field: &'static str,
+    rows: &[ArtifactManifestRow],
+) -> Result<(), ProtocolError> {
+    validate_artifact_batch(field, rows)?;
+    for row in rows {
+        row.validate()?;
+    }
+    let mut previous = None;
+    for row in rows {
+        if previous.is_some_and(|previous| previous >= row.object_index) {
+            return Err(ProtocolError::invalid(
+                field,
+                "object indexes must be strictly increasing",
+            ));
+        }
+        previous = Some(row.object_index);
+    }
+    Ok(())
+}
+
+fn validate_dependency_owners(
+    field: &'static str,
+    owners: &[ArtifactRevisionIdentity],
+) -> Result<(), ProtocolError> {
+    if owners.len()
+        > usize::try_from(crate::MAX_ARTIFACT_DEPENDENCY_OWNERS)
+            .expect("artifact dependency owner limit fits usize")
+    {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("exceeds {}", crate::MAX_ARTIFACT_DEPENDENCY_OWNERS),
+        ));
+    }
+    if !owners.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ProtocolError::invalid(field, "must be sorted and unique"));
+    }
+    Ok(())
+}
+
+fn require_strict_sequences(
+    field: &'static str,
+    sequences: impl Iterator<Item = u64>,
+) -> Result<(), ProtocolError> {
+    let mut previous = None;
+    for sequence in sequences {
+        if previous.is_some_and(|previous| previous >= sequence) {
+            return Err(ProtocolError::invalid(
+                field,
+                "sequences must be strictly increasing",
+            ));
+        }
+        previous = Some(sequence);
+    }
+    Ok(())
+}
+
+fn validate_required_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Err(ProtocolError::invalid(field, "must not be empty"));
+    }
+    validate_optional_text(field, Some(value), max)
+}
+
+fn validate_presentation_path_root(value: &str) -> Result<(), String> {
+    const MAX_BYTES: usize = 4096;
+    const MAX_COMPONENTS: usize = 64;
+
+    if value.len() > MAX_BYTES {
+        return Err(format!(
+            "root is {} bytes, maximum is {MAX_BYTES}",
+            value.len()
+        ));
+    }
+    let Some(relative) = value.strip_prefix('/') else {
+        return Err("root must be absolute".to_owned());
+    };
+    if relative.is_empty() {
+        return Err("root must not be /".to_owned());
+    }
+    let mut components = 0_usize;
+    for component in relative.split('/') {
+        components += 1;
+        if components > MAX_COMPONENTS {
+            return Err(format!(
+                "root has {components} components, maximum is {MAX_COMPONENTS}"
+            ));
+        }
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err("root must use non-empty components without '.' or '..'".to_owned());
+        }
+        if component.contains('\\') || component.contains('\0') {
+            return Err("root must not contain backslashes or NUL".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_generic_index_field_id(field: &'static str, value: &str) -> Result<(), ProtocolError> {
+    validate_field_id(field, value)?;
+    if GENERIC_INDEX_BUILTIN_FIELD_IDS
+        .binary_search(&value)
+        .is_ok()
+    {
+        return Err(ProtocolError::invalid(
+            field,
+            "is reserved by the Generic namespace projection",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_catalog_field_prefix(value: &str) -> Result<(), ProtocolError> {
+    const MAX_BYTES: usize = 128;
+    validate_optional_text("catalog.field_prefix", Some(value), MAX_BYTES)
+}
+
+fn validate_field_ids(
+    field: &'static str,
+    values: &[String],
+    max: usize,
+) -> Result<(), ProtocolError> {
+    if values.len() > max {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("exceeds {max} fields"),
+        ));
+    }
+    for value in values {
+        validate_field_id(field, value)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXPECTED_QUERY_PAGE_LIMIT: u32 = 256;
+
+    fn query_requests(limit: u32) -> Vec<(WorkspaceRequest, &'static str)> {
+        let page = || PageRequest {
+            cursor: None,
+            limit,
+        };
+        let scope = || QueryScope::Root { path_prefix: None };
+        vec![
+            (
+                WorkspaceRequest::Search(SearchRequest {
+                    profile: QueryProfile::ArtifactV1,
+                    scope: scope(),
+                    predicates: Vec::new(),
+                    projection: Vec::new(),
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    page: page(),
+                }),
+                "search.page",
+            ),
+            (
+                WorkspaceRequest::Aggregate(AggregateRequest {
+                    profile: QueryProfile::ArtifactV1,
+                    scope: scope(),
+                    predicates: Vec::new(),
+                    group_by: Vec::new(),
+                    aggregates: vec![AggregateSpec {
+                        function: AggregateFunction::Count,
+                        field_id: None,
+                        result_id: "count".to_owned(),
+                    }],
+                    sort: Vec::new(),
+                    page: page(),
+                }),
+                "aggregate.page",
+            ),
+            (
+                WorkspaceRequest::Catalog(CatalogRequest {
+                    profile: QueryProfile::ArtifactV1,
+                    scope: scope(),
+                    path_match: CatalogPathMatch::Prefix,
+                    field_prefix: None,
+                    include_facets: false,
+                    page: page(),
+                }),
+                "catalog.page",
+            ),
+            (
+                WorkspaceRequest::FindWorkspaces(FindWorkspacesRequest {
+                    committed_only: false,
+                    page: page(),
+                }),
+                "find_workspaces.page",
+            ),
+        ]
+    }
+
+    const EXPECTED_CHANGE_PAGE_LIMIT: u32 = 64;
+
+    fn change_request(limit: u32) -> WorkspaceRequest {
+        WorkspaceRequest::ReadChanges(ChangePageRequest {
+            after_commit_version: None,
+            workbench: None,
+            page: PageRequest {
+                cursor: None,
+                limit,
+            },
+        })
+    }
+
+    #[test]
+    fn change_pages_are_capped_below_query_pages() {
+        assert_eq!(MAX_CHANGE_PAGE_LIMIT, EXPECTED_CHANGE_PAGE_LIMIT);
+        change_request(EXPECTED_CHANGE_PAGE_LIMIT)
+            .validate()
+            .unwrap();
+
+        let ProtocolError::InvalidField { field, reason } =
+            change_request(EXPECTED_CHANGE_PAGE_LIMIT + 1)
+                .validate()
+                .unwrap_err()
+        else {
+            panic!("a change page above the cap must fail as invalid input");
+        };
+        assert_eq!(field, "read_changes.page");
+        assert!(reason.contains("64"), "{reason}");
+    }
+
+    #[test]
+    fn query_requests_reject_pages_above_the_execution_limit() {
+        assert_eq!(MAX_QUERY_PAGE_LIMIT, EXPECTED_QUERY_PAGE_LIMIT);
+        for (request, _) in query_requests(EXPECTED_QUERY_PAGE_LIMIT) {
+            request.validate().unwrap();
+        }
+
+        for (request, expected_field) in query_requests(EXPECTED_QUERY_PAGE_LIMIT + 1) {
+            let ProtocolError::InvalidField { field, .. } = request.validate().unwrap_err() else {
+                panic!("query page limit must fail as invalid input");
+            };
+            assert_eq!(field, expected_field);
+        }
+    }
+
+    #[test]
+    fn exact_catalog_requires_a_non_empty_path_prefix() {
+        for scope in [
+            QueryScope::Root { path_prefix: None },
+            QueryScope::Workspace {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path_prefix: None,
+            },
+        ] {
+            let request = WorkspaceRequest::Catalog(CatalogRequest {
+                profile: QueryProfile::ArtifactV1,
+                scope,
+                path_match: CatalogPathMatch::Exact,
+                field_prefix: None,
+                include_facets: false,
+                page: PageRequest {
+                    cursor: None,
+                    limit: 1,
+                },
+            });
+            let ProtocolError::InvalidField { field, .. } = request.validate().unwrap_err() else {
+                panic!("exact catalog without a path must fail as invalid input");
+            };
+            assert_eq!(field, "catalog.path_match");
+        }
+    }
+
+    #[test]
+    fn generic_catalog_empty_field_prefix_is_omitted_but_artifact_profile_stays_strict() {
+        let request = |profile, field_prefix: &str| {
+            WorkspaceRequest::Catalog(CatalogRequest {
+                profile,
+                scope: QueryScope::Root { path_prefix: None },
+                path_match: CatalogPathMatch::Prefix,
+                field_prefix: Some(field_prefix.to_owned()),
+                include_facets: false,
+                page: PageRequest {
+                    cursor: None,
+                    limit: 1,
+                },
+            })
+        };
+        for field_prefix in ["", "body producer", "body/producer"] {
+            request(
+                QueryProfile::GenericCustomIndexV1 {
+                    presentation_path_root: "/agents".to_owned(),
+                },
+                field_prefix,
+            )
+            .validate()
+            .unwrap();
+        }
+        let ProtocolError::InvalidField { field, .. } = request(QueryProfile::ArtifactV1, "")
+            .validate()
+            .unwrap_err()
+        else {
+            panic!("ArtifactV1 empty field prefix must remain invalid");
+        };
+        assert_eq!(field, "catalog.field_prefix");
+    }
+
+    #[test]
+    fn generic_query_profile_rejects_noncanonical_or_unbounded_presentation_roots() {
+        for presentation_path_root in [
+            "/".to_owned(),
+            "agents".to_owned(),
+            "/agents/".to_owned(),
+            "/agents//nested".to_owned(),
+            "/agents/../nested".to_owned(),
+            format!("/{}", "x".repeat(4096)),
+        ] {
+            let error = WorkspaceRequest::Search(SearchRequest {
+                profile: QueryProfile::GenericCustomIndexV1 {
+                    presentation_path_root,
+                },
+                scope: QueryScope::Root { path_prefix: None },
+                predicates: Vec::new(),
+                projection: Vec::new(),
+                sort: Vec::new(),
+                facets: Vec::new(),
+                page: PageRequest {
+                    cursor: None,
+                    limit: 1,
+                },
+            })
+            .validate()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ProtocolError::InvalidField {
+                    field: "query_profile.presentation_path_root",
+                    ..
+                }
+            ));
+        }
+    }
+
+    fn get_path(range: Option<ByteRange>, plan_page: Option<PageRequest>) -> GetPathRequest {
+        GetPathRequest {
+            target: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new("outputs/result.bin").unwrap(),
+            },
+            view: WorkspaceReadView::Live,
+            expected_read_version: None,
+            range,
+            plan_page,
+            if_none_match: None,
+        }
+    }
+
+    #[test]
+    fn get_path_rejects_a_zero_expected_read_version() {
+        let mut request = get_path(None, None);
+        request.expected_read_version = Some(0);
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "get_path.expected_read_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_paths_rejects_a_zero_expected_read_version() {
+        let request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: Some(0),
+            workspace_continuation_fence: None,
+            page: PageRequest {
+                cursor: None,
+                limit: 1,
+            },
+        };
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.expected_read_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_paths_requires_a_read_version_fence_for_continuations() {
+        let request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: None,
+            workspace_continuation_fence: None,
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
+                limit: 1,
+            },
+        };
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.expected_read_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_paths_accepts_a_workspace_fence_for_live_continuations() {
+        let request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: None,
+            workspace_continuation_fence: Some(WorkspaceContinuationFence {
+                workspace_incarnation_id: WorkspaceIdentity([7; 16]),
+                workspace_revision: 3,
+            }),
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
+                limit: 1,
+            },
+        };
+
+        request.validate().unwrap();
+    }
+
+    #[test]
+    fn list_paths_rejects_ambiguous_or_snapshot_workspace_fences() {
+        let fence = WorkspaceContinuationFence {
+            workspace_incarnation_id: WorkspaceIdentity([7; 16]),
+            workspace_revision: 3,
+        };
+        let mut request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: Some(9),
+            workspace_continuation_fence: Some(fence.clone()),
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
+                limit: 1,
+            },
+        };
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.workspace_continuation_fence",
+                ..
+            })
+        ));
+        request.expected_read_version = None;
+        request.view = WorkspaceReadView::Snapshot(SnapshotSelector::Id(9));
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.workspace_continuation_fence",
+                ..
+            })
+        ));
+    }
+
+    fn begin_manifest_publish(
+        path: &str,
+        authority: PublicationAuthority,
+        condition: PublishCondition,
+    ) -> BeginArtifactPublishRequest {
+        BeginArtifactPublishRequest {
+            append_attempt: None,
+            append_intent_digest: None,
+            operation_id: OperationIdentity([1; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([2; 16]),
+            target: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new(path).unwrap(),
+            },
+            authority,
+            condition,
+            expected_workspace_incarnation_id: None,
+            staged_object_count: 1,
+            staged_object_seal: Digest([3; 32]),
+            manifest_row_count: 1,
+            manifest_seal: Digest([4; 32]),
+            dependency_owner_revision_ids: Vec::new(),
+            inline_body_digest: None,
+        }
+    }
+
+    fn staged_object(sequence: u32) -> StagedObject {
+        StagedObject {
+            sequence,
+            object_identity: crate::ObjectIdentity::new(format!("objects/{sequence}")).unwrap(),
+            expected_length: 1,
+            expected_digest: crate::sha256_digest_uri(Digest([5; 32])),
+        }
+    }
+
+    fn finish_request() -> FinishArtifactPublishRequest {
+        FinishArtifactPublishRequest {
+            token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: Digest([6; 32]),
+            },
+            manifest_rows: vec![ArtifactManifestRow {
+                object_index: 0,
+                physical_object_index: 0,
+                logical_offset: 0,
+                physical_owner_revision_id: ArtifactRevisionIdentity([2; 16]),
+                object_identity: crate::ObjectIdentity::new("objects/0").unwrap(),
+                object_offset: 0,
+                length: 1,
+                digest: crate::sha256_digest_uri(Digest([5; 32])),
+                append_segment: None,
+            }],
+            dependency_owner_revision_ids: Vec::new(),
+            artifact: ArtifactDescriptor {
+                logical_size: 1,
+                body_digest: crate::sha256_digest_uri(Digest([5; 32])),
+                manifest_digest: crate::sha256_digest_uri(Digest([4; 32])),
+                content_type: crate::ContentType::new("application/octet-stream").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn prepare_carries_exactly_the_sealed_object_plan() {
+        let begin = begin_manifest_publish(
+            "outputs/result.bin",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        PrepareArtifactPublishRequest {
+            begin: begin.clone(),
+            objects: vec![staged_object(0)],
+        }
+        .validate()
+        .unwrap();
+        for objects in [Vec::new(), vec![staged_object(0), staged_object(1)]] {
+            assert!(matches!(
+                PrepareArtifactPublishRequest {
+                    begin: begin.clone(),
+                    objects,
+                }
+                .validate(),
+                Err(ProtocolError::InvalidField {
+                    field: "prepare_artifact_publish.objects",
+                    ..
+                })
+            ));
+        }
+        let mut empty_plan = begin.clone();
+        empty_plan.staged_object_count = 0;
+        PrepareArtifactPublishRequest {
+            begin: empty_plan,
+            objects: Vec::new(),
+        }
+        .validate()
+        .unwrap();
+
+        // The Begin half keeps every Begin rule.
+        let mut staging = begin;
+        staging.authority = PublicationAuthority::CommitStaging {
+            commit_operation_id: OperationIdentity([5; 16]),
+        };
+        assert!(matches!(
+            PrepareArtifactPublishRequest {
+                begin: staging,
+                objects: vec![staged_object(0)],
+            }
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_upload_carries_one_bounded_nonempty_block() {
+        let upload = |body: Vec<u8>| UploadArtifactObjectRequest {
+            token: OperationToken {
+                operation_id: OperationIdentity([1; 16]),
+                state_digest: Digest([6; 32]),
+            },
+            sequence: 0,
+            body,
+        };
+        upload(vec![7]).validate().unwrap();
+        upload(vec![7; MAX_ARTIFACT_UPLOAD_BODY_BYTES])
+            .validate()
+            .unwrap();
+        for body in [Vec::new(), vec![7; MAX_ARTIFACT_UPLOAD_BODY_BYTES + 1]] {
+            assert!(matches!(
+                upload(body).validate(),
+                Err(ProtocolError::InvalidField {
+                    field: "upload_artifact_object.body",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn finish_validates_each_step_it_carries() {
+        finish_request().validate().unwrap();
+        let mut complete_only = finish_request();
+        complete_only.manifest_rows.clear();
+        complete_only.validate().unwrap();
+        let mut repeated_row = finish_request();
+        repeated_row
+            .manifest_rows
+            .push(repeated_row.manifest_rows[0].clone());
+        assert!(matches!(
+            repeated_row.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "finish_artifact_publish.manifest_rows",
+                ..
+            })
+        ));
+        let mut unsorted_owners = finish_request();
+        unsorted_owners.dependency_owner_revision_ids = vec![
+            ArtifactRevisionIdentity([8; 16]),
+            ArtifactRevisionIdentity([7; 16]),
+        ];
+        assert!(matches!(
+            unsorted_owners.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "finish_artifact_publish.dependency_owner_revision_ids",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn publish_incarnation_fence_is_visible_only() {
+        let mut visible = begin_manifest_publish(
+            "outputs/result.bin",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        visible.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        visible.validate().unwrap();
+
+        let mut staging = begin_manifest_publish(
+            "metadata/run_manifest.json",
+            PublicationAuthority::CommitStaging {
+                commit_operation_id: OperationIdentity([5; 16]),
+            },
+            PublishCondition::CreateOnly,
+        );
+        staging.validate().unwrap();
+        staging.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        assert!(matches!(
+            staging.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.expected_workspace_incarnation_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stable_append_requires_a_visible_incarnation_and_generation_bound_plan() {
+        let mut request = begin_manifest_publish(
+            "outputs/events.log",
+            PublicationAuthority::Visible,
+            PublishCondition::CreateOnly,
+        );
+        request.append_intent_digest = Some(Digest([0x61; 32]));
+        request.append_attempt = Some(crate::AppendAttemptBinding {
+            operation_id: OperationIdentity([0x62; 16]),
+            attempt: 0,
+        });
+        assert!(request.validate().is_err());
+        request.expected_workspace_incarnation_id = Some(WorkspaceIdentity([9; 16]));
+        request.validate().unwrap();
+        request.condition = PublishCondition::Append {
+            expected_generation: Some(7),
+        };
+        request.validate().unwrap();
+        for condition in [
+            PublishCondition::Append {
+                expected_generation: None,
+            },
+            PublishCondition::ReplaceOnly {
+                expected_generation: 7,
+            },
+        ] {
+            request.condition = condition;
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn get_path_separates_metadata_only_reads_from_bounded_plan_pages() {
+        get_path(None, None).validate().unwrap();
+
+        let range = ByteRange {
+            offset: 7,
+            length: 11,
+        };
+        let page = PageRequest {
+            cursor: None,
+            limit: crate::MAX_ARTIFACT_READ_PLAN_ROWS as u32,
+        };
+        get_path(Some(range), Some(page.clone()))
+            .validate()
+            .unwrap();
+
+        assert!(matches!(
+            get_path(None, Some(page.clone())).validate(),
+            Err(ProtocolError::InvalidField {
+                field: "get_path.plan_page",
+                ..
+            })
+        ));
+        assert!(matches!(
+            get_path(Some(range), None).validate(),
+            Err(ProtocolError::InvalidField {
+                field: "get_path.plan_page",
+                ..
+            })
+        ));
+
+        let oversized_page = PageRequest {
+            cursor: None,
+            limit: crate::MAX_ARTIFACT_READ_PLAN_ROWS as u32 + 1,
+        };
+        assert!(matches!(
+            get_path(Some(range), Some(oversized_page)).validate(),
+            Err(ProtocolError::InvalidField {
+                field: "get_path.plan_page.limit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_manifests_require_their_exact_lifecycle_authority() {
+        let run_manifest = "metadata/run_manifest.json";
+        let restore_manifest = "metadata/restore_manifest.json";
+        assert!(matches!(
+            begin_manifest_publish(
+                run_manifest,
+                PublicationAuthority::Visible,
+                PublishCondition::CreateOnly,
+            )
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+        assert!(matches!(
+            begin_manifest_publish(
+                restore_manifest,
+                PublicationAuthority::CommitStaging {
+                    commit_operation_id: OperationIdentity([5; 16]),
+                },
+                PublishCondition::CreateOnly,
+            )
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+        assert!(matches!(
+            begin_manifest_publish(
+                run_manifest,
+                PublicationAuthority::CommitStaging {
+                    commit_operation_id: OperationIdentity([5; 16]),
+                },
+                PublishCondition::Append {
+                    expected_generation: Some(1),
+                },
+            )
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+        begin_manifest_publish(
+            run_manifest,
+            PublicationAuthority::CommitStaging {
+                commit_operation_id: OperationIdentity([5; 16]),
+            },
+            PublishCondition::CreateOnly,
+        )
+        .validate()
+        .unwrap();
+        begin_manifest_publish(
+            restore_manifest,
+            PublicationAuthority::RestoreStaging {
+                restore_operation_id: OperationIdentity([6; 16]),
+            },
+            PublishCondition::CreateOnly,
+        )
+        .validate()
+        .unwrap();
+        begin_manifest_publish(
+            run_manifest,
+            PublicationAuthority::RestoreStaging {
+                restore_operation_id: OperationIdentity([6; 16]),
+            },
+            PublishCondition::CreateOnly,
+        )
+        .validate()
+        .unwrap();
+
+        assert!(matches!(
+            begin_manifest_publish(
+                run_manifest,
+                PublicationAuthority::RestoreStaging {
+                    restore_operation_id: OperationIdentity([6; 16]),
+                },
+                PublishCondition::Append {
+                    expected_generation: Some(1),
+                },
+            )
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
+
+        for manifest_path in [run_manifest, restore_manifest] {
+            let request = RemovePathRequest {
+                target: WorkspacePath {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    path: crate::RelativePath::new(manifest_path).unwrap(),
+                },
+                expected_generation: 1,
+            };
+            assert!(matches!(
+                request.validate(),
+                Err(ProtocolError::InvalidField {
+                    field: "remove_path.target.path",
+                    ..
+                })
+            ));
+        }
+    }
+
+    fn rename_request(source: &str, destination: &str) -> RenamePathRequest {
+        RenamePathRequest {
+            source: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new(source).unwrap(),
+            },
+            destination: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new(destination).unwrap(),
+            },
+            expected_generation: 7,
+        }
+    }
+
+    #[test]
+    fn rename_path_is_same_workbench_create_only_shape_and_fences_reserved_manifests() {
+        rename_request("outputs/a.bin", "outputs/b.bin")
+            .validate()
+            .unwrap();
+
+        let same_path = rename_request("outputs/a.bin", "outputs/a.bin");
+        assert!(matches!(
+            same_path.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.destination.path",
+                ..
+            })
+        ));
+
+        let mut cross_workbench = rename_request("outputs/a.bin", "outputs/b.bin");
+        cross_workbench.destination.workbench = WorkbenchName::new("other").unwrap();
+        assert!(matches!(
+            cross_workbench.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.destination.workbench",
+                ..
+            })
+        ));
+
+        let mut zero_generation = rename_request("outputs/a.bin", "outputs/b.bin");
+        zero_generation.expected_generation = 0;
+        assert!(matches!(
+            zero_generation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.expected_generation",
+                ..
+            })
+        ));
+
+        for (source, destination, field) in [
+            (
+                "metadata/run_manifest.json",
+                "outputs/b.bin",
+                "rename_path.source.path",
+            ),
+            (
+                "outputs/a.bin",
+                "metadata/restore_manifest.json",
+                "rename_path.destination.path",
+            ),
+        ] {
+            assert!(matches!(
+                rename_request(source, destination).validate(),
+                Err(ProtocolError::InvalidField { field: actual, .. }) if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn restore_manifest_descriptor_is_required_and_bounded() {
+        let descriptor = RestoreManifestDescriptor {
+            body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
+            logical_size: 128,
+            content_type: crate::ContentType::new("application/json").unwrap(),
+        };
+        descriptor.validate().unwrap();
+
+        let mut wrong_type = descriptor.clone();
+        wrong_type.content_type = crate::ContentType::new("text/plain").unwrap();
+        assert!(matches!(
+            wrong_type.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "prepare_restore.restore_manifest.content_type",
+                ..
+            })
+        ));
+
+        let mut empty = descriptor;
+        empty.logical_size = 0;
+        assert!(matches!(
+            empty.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "prepare_restore.restore_manifest.logical_size",
+                ..
+            })
+        ));
+
+        let noncanonical = RestoreManifestDescriptor {
+            body_digest: DigestUri::new(format!("sha256:{}", "AB".repeat(32))).unwrap(),
+            logical_size: 128,
+            content_type: crate::ContentType::new("application/json").unwrap(),
+        };
+        assert!(matches!(
+            noncanonical.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "prepare_restore.restore_manifest.body_digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_preparation_requires_a_concrete_snapshot_id() {
+        let descriptor = RestoreManifestDescriptor {
+            body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
+            logical_size: 128,
+            content_type: crate::ContentType::new("application/json").unwrap(),
+        };
+        let mut request = PrepareRestoreRequest {
+            operation_id: OperationIdentity([9; 16]),
+            source_workbench: WorkbenchName::new("source").unwrap(),
+            source_workspace_incarnation_id: WorkspaceIdentity([1; 16]),
+            source: RestoreSource::Snapshot(SnapshotSelector::Id(7)),
+            destination_workbench: WorkbenchName::new("destination").unwrap(),
+            destination_workspace_incarnation_id: WorkspaceIdentity([2; 16]),
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([7; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([8; 16]),
+            },
+            restore_manifest: descriptor,
+        };
+        request.validate().unwrap();
+
+        request.source = RestoreSource::Snapshot(SnapshotSelector::Alias(
+            SnapshotAlias::new("latest").unwrap(),
+        ));
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "prepare_restore.source",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_destination_binding_requires_distinct_manifest_publications() {
+        let mut request = BindRestoreDestinationRequest {
+            operation_id: OperationIdentity([1; 16]),
+            destination_commit_id: CommitIdentity([2; 32]),
+            effective_content_digest: DigestUri::new(format!("sha256:{}", "03".repeat(32)))
+                .unwrap(),
+            destination_run_manifest_projection_input_digest: Digest([4; 32]),
+            destination_run_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([5; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([6; 16]),
+            },
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([7; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([8; 16]),
+            },
+        };
+        request.validate().unwrap();
+
+        request
+            .destination_restore_manifest_identity
+            .publication_operation_id = request
+            .destination_run_manifest_identity
+            .publication_operation_id;
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_manifests",
+                ..
+            })
+        ));
+        request
+            .destination_restore_manifest_identity
+            .publication_operation_id = OperationIdentity([7; 16]);
+        request
+            .destination_restore_manifest_identity
+            .artifact_revision_id = request
+            .destination_run_manifest_identity
+            .artifact_revision_id;
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_manifests",
+                ..
+            })
+        ));
+
+        request
+            .destination_restore_manifest_identity
+            .artifact_revision_id = ArtifactRevisionIdentity([8; 16]);
+        request.destination_run_manifest_projection_input_digest = Digest([0; 32]);
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_run_manifest_projection_input_digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_source_run_manifest_read_requires_a_bounded_plan() {
+        let operation_id = OperationIdentity([1; 16]);
+        ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: None,
+            plan_page: None,
+        }
+        .validate()
+        .unwrap();
+        let range = ByteRange {
+            offset: 5,
+            length: 8,
+        };
+        ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: Some(PageRequest {
+                cursor: None,
+                limit: crate::MAX_ARTIFACT_READ_PLAN_ROWS as u32,
+            }),
+        }
+        .validate()
+        .unwrap();
+
+        assert!(ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: None,
+        }
+        .validate()
+        .is_err());
+        assert!(ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: Some(PageRequest {
+                cursor: vec![0; PageRequest::MAX_CURSOR_BYTES + 1].into(),
+                limit: 1,
+            }),
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn get_snapshot_accepts_aliases_and_rejects_zero_ids_at_its_exact_field() {
+        GetSnapshotRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            selector: SnapshotSelector::Alias(SnapshotAlias::new("checkpoint").unwrap()),
+        }
+        .validate()
+        .unwrap();
+
+        assert!(matches!(
+            GetSnapshotRequest {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                selector: SnapshotSelector::Id(0),
+            }
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "get_snapshot.selector",
+                ..
+            })
+        ));
+    }
+}

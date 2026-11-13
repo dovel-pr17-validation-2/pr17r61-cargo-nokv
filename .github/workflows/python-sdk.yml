@@ -1,0 +1,97 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Python SDK
+
+# The release workflow builds the same wheel per platform from a validated tag.
+# This job proves on every change that the manylinux wheel still builds from
+# the tree, installs into a clean interpreter, and passes the SDK tests
+# against the installed distribution rather than the source checkout.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: manylinux wheel builds and installs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+
+      - name: Check the release identities the wheel will carry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/test_python_sdk_release.py
+          python3 scripts/release/python_sdk_release.py sdk-version --repository .
+
+      - name: Build manylinux_2_28 wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          working-directory: crates/nokv-python
+          args: --release --out ../../dist
+          manylinux: 2_28
+          before-script-linux: |
+            set -euo pipefail
+            # etcd-client compiles proto3 files that use `optional` fields and
+            # import the well-known types. AlmaLinux 8's protoc 3.5 cannot build
+            # them, so install the official protoc release, pinned by checksum.
+            protoc_version=36.2
+            case "$(uname -m)" in
+              x86_64) protoc_arch=x86_64; protoc_sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+              aarch64) protoc_arch=aarch_64; protoc_sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+              *) echo "no pinned protoc for $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 --retry 5 --location --silent --show-error --fail \
+              --output /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-${protoc_arch}.zip"
+            echo "${protoc_sha256}  /tmp/protoc.zip" | sha256sum -c -
+            python="$(ls /opt/python/cp3*/bin/python3 | sort -V | tail -n 1)"
+            "$python" -m zipfile -e /tmp/protoc.zip /usr/local
+            chmod 0755 /usr/local/bin/protoc
+            protoc --version
+
+      - name: Install the built wheel into a clean environment and test it
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          version="$(python3 scripts/release/python_sdk_release.py sdk-version --repository .)"
+          venv="$RUNNER_TEMP/nokv-sdk-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/python" -m pip install --quiet --upgrade pip
+          "$venv/bin/python" -m pip install --quiet pytest fsspec 'msgpack>=1.1,<2'
+          # The torch DCP adapter drives PyTorch planner internals, so the
+          # real-DCP tests must run here rather than skip: install a pinned
+          # CPU-only PyTorch for this job's Python and require those tests.
+          "$venv/bin/python" -m pip install --quiet \
+            --index-url https://download.pytorch.org/whl/cpu torch==2.10.0
+          "$venv/bin/python" -m pip install --quiet --no-index --find-links dist "nokv==$version"
+          python3 scripts/release/python_sdk_release.py verify-install \
+            --python "$venv/bin/python" --version "$version"
+          cd "$RUNNER_TEMP"
+          NOKV_TEST_INSTALLED_WHEEL=1 NOKV_TEST_REQUIRE_TORCH=1 \
+            "$venv/bin/python" -m pytest -q "$GITHUB_WORKSPACE/crates/nokv-python/tests"
+
+      - name: Upload wheel for inspection
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nokv-python-sdk-${{ github.sha }}-linux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7

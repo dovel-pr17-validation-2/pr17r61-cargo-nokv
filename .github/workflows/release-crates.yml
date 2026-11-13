@@ -1,0 +1,133 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to publish, for example v0.1.0"
+        required: true
+      dry_run:
+        description: "Package crates without publishing to crates.io"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          set -euo pipefail
+          # apt has hung on an unreachable mirror long enough to wedge a
+          # required check for half an hour, and the step it wedges is not
+          # the code under test, so the red lands nowhere useful. Bound each
+          # call and retry rather than letting a mirror decide the build.
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get update \
+              && sudo timeout 300 apt-get install -y protobuf-compiler; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying" >&2
+            sudo pkill -f apt-get || true
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install protobuf-compiler after 3 attempts" >&2
+          exit 1
+
+      - name: Resolve crate list
+        id: crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates=(
+            nokv-types
+            nokv-protocol
+            nokv-object
+            nokv-meta-store
+            nokv-meta-holt
+            nokv-meta
+            nokv-agent
+            nokv-control
+            nokv-server
+            nokv-client
+            nokv
+          )
+          {
+            echo "list<<EOF"
+            printf '%s\n' "${crates[@]}"
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify crate list matches workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish == null) | .name' | sort)"
+          actual="$(sort <<<"${{ steps.crates.outputs.list }}")"
+          if [[ "$expected" != "$actual" ]]; then
+            echo "::error title=Crate list drift::The workflow crate list does not match the workspace's publishable members."
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+
+      - name: Package crates
+        if: inputs.dry_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Workspace mode resolves not-yet-published workspace siblings from
+          # the local package overlay; a -p list would look them up on
+          # crates.io and fail until every crate has been published once.
+          # This also packages the publish = false members (nokv-bench,
+          # nokv-python) as extra validation; only the publish step below
+          # is gated by the crate list.
+          cargo package --locked --workspace
+
+      - name: Publish crates
+        if: inputs.dry_run == 'false'
+        shell: bash
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CRATES_IO_TOKEN:-}" ]]; then
+            echo "::error title=Missing crates.io token::Set the CRATES_IO_TOKEN repository secret."
+            exit 1
+          fi
+
+          while IFS= read -r crate; do
+            [[ -z "$crate" ]] && continue
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version')"
+            if [[ -z "$version" ]]; then
+              echo "::error title=Unknown crate::Unable to resolve $crate in workspace metadata."
+              exit 1
+            fi
+            # crates.io rejects requests without a User-Agent (403), which
+            # would make this existence check always fail and re-publish.
+            if curl -fsS -A "nokv-release-workflow (github.com/NoKV-Lab/NoKV)" -o /dev/null "https://crates.io/api/v1/crates/${crate}/${version}"; then
+              echo "Skipping ${crate} ${version}; it already exists on crates.io."
+              continue
+            fi
+            cargo publish --locked -p "$crate" --token "$CRATES_IO_TOKEN"
+            sleep 30
+          done <<<"${{ steps.crates.outputs.list }}"

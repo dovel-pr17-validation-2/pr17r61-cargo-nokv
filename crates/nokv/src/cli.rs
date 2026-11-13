@@ -1,0 +1,3260 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Argument parsing for the Agent-workspace CLI.
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use nokv_control::RoleBinding;
+use nokv_types::{CredentialFingerprint, PrincipalId, Role, RoleScope, RootId, TenantId};
+
+pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
+pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
+pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
+pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
+pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_APPEND_ACTIVITY_LEASE_MS: u64 = 1_800_000;
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
+pub const DEFAULT_MAX_RETRY_BACKOFF_MILLIS: u64 = 2_000;
+pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientConfig {
+    pub root_id: Option<String>,
+    pub routing: RoutingConfig,
+    pub max_attempts: u32,
+    pub retry_backoff_ms: u64,
+    pub max_retry_backoff_ms: u64,
+    pub max_artifact_bytes: usize,
+    pub object: ObjectConfig,
+    pub tls: Option<ClientTlsConfig>,
+}
+
+/// Workspace RPC over TLS for a command that connects to an owner: PEM
+/// files, and the name the owner's certificate must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientTlsConfig {
+    pub server_roots: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub server_name: String,
+}
+
+/// Workspace RPC over TLS for `serve`: the owner's certificate chain and
+/// private key as PEM files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerTlsConfig {
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutingConfig {
+    Static(StaticRoutingConfig),
+    Etcd(EtcdRoutingConfig),
+    Local(LocalRoutingConfig),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticRoutingConfig {
+    pub metadata_address: SocketAddr,
+    pub logical_shard_id: Option<String>,
+    pub object_namespace_id: Option<String>,
+    pub placement_generation: Option<u64>,
+    pub owner_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtcdRoutingConfig {
+    pub endpoints: Vec<String>,
+    pub key_prefix: String,
+    pub lease_ttl_seconds: i64,
+    /// This process's identity towards etcd; required with `https://`
+    /// endpoints.
+    pub tls: Option<EtcdTlsFiles>,
+}
+
+/// The PEM files behind `--etcd-tls-ca`, `--etcd-tls-cert` and
+/// `--etcd-tls-key`: the roots that sign etcd's certificate, and this
+/// process's certificate chain and private key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtcdTlsFiles {
+    pub trusted_ca: PathBuf,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+}
+
+/// Single-host control directory shared by the owner and its clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRoutingConfig {
+    pub directory: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectConfig {
+    pub bucket: Option<String>,
+    pub root: String,
+    pub region: String,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub virtual_host_style: bool,
+    pub skip_signature: bool,
+    pub hot_cache_dir: Option<PathBuf>,
+    pub hot_cache_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub bind: SocketAddr,
+    pub handshake_timeout_millis: u64,
+    pub max_inflight_connections: usize,
+    pub advertise_endpoint: Option<String>,
+    pub node_id: Option<String>,
+    pub metadata_store: Option<MetadataStoreConfig>,
+    pub lifecycle_interval_millis: u64,
+    pub append_activity_lease_ms: u64,
+    pub recovery_publication: RecoveryPublicationConfig,
+    pub tls: Option<ServerTlsConfig>,
+    /// Where a TLS owner appends one JSON line per refusal.
+    pub audit_log: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataStoreConfig {
+    Create(PathBuf),
+    Reopen(PathBuf),
+    RecoverLog(PathBuf),
+}
+
+/// `serve --recovery-publication` selection.
+///
+/// `LocalOnly` is the resting state: the exclusive local Holt WAL is the only
+/// recovery authority and nothing is published to Control. `Shared` uploads
+/// every applied outbox tail as immutable log segments plus control
+/// references before a response leaves the shard; until shared checkpoint
+/// compaction bounds that segment chain it is an opt-in, and it is implied by
+/// `--metadata-recover-log`, which can only resume from a shared frontier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryPublicationConfig {
+    Shared,
+    #[default]
+    LocalOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub client: ClientConfig,
+    pub server: ServerConfig,
+    pub agent_id: Option<String>,
+    pub command: Command,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    Workbench {
+        tool: String,
+        arguments: String,
+    },
+    /// Sequential Workbench calls, one JSON line each, over one client.
+    WorkbenchSession,
+    Materialize {
+        workbench: String,
+        section: String,
+        path: String,
+        destination: PathBuf,
+    },
+    Collect {
+        workbench: String,
+        section: String,
+        source: PathBuf,
+        path: String,
+        replace: bool,
+        expected_generation: Option<u64>,
+        content_type: Option<String>,
+        /// Publishes under this caller identity, replayable across processes.
+        operation_id: Option<[u8; 16]>,
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+    },
+    WorkspacePath(WorkspacePathCommand),
+    OperationStatus {
+        operation_id: [u8; 16],
+    },
+    /// Status of the commit operation whose identity derives from this
+    /// commit identity, as `workbench_commit` reports it.
+    CommitStatus {
+        commit_identity: [u8; 32],
+    },
+    OperationInspect {
+        operation_id: [u8; 16],
+        limit: u32,
+        cursor: Option<Vec<u8>>,
+    },
+    OperationRecover {
+        operation_id: [u8; 16],
+        expected_state_digest: Option<[u8; 32]>,
+    },
+    Provision {
+        logical_shard_id: String,
+        /// The Workbench root every Agent of the root presents it under.
+        workbench_root: String,
+        adopt_legacy_object_namespace: bool,
+        adopt_legacy_agent_binding: bool,
+    },
+    Serve,
+    /// Tenant identity administration in the control plane.
+    Identity(IdentityCommand),
+    Schema,
+    Version {
+        json: bool,
+    },
+    Help,
+}
+
+/// One `nokv identity` administration command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityCommand {
+    CreateTenant {
+        tenant_id: TenantId,
+    },
+    CreatePrincipal {
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    },
+    AddCredential {
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+        credential: CredentialSource,
+        expires_at_unix_seconds: u64,
+    },
+    RevokeCredential {
+        tenant_id: TenantId,
+        fingerprint: CredentialFingerprint,
+    },
+    GrantRole(RoleBinding),
+    RevokeRole(RoleBinding),
+    BindRoot {
+        root_id: RootId,
+        tenant_id: TenantId,
+    },
+    Show {
+        tenant_id: TenantId,
+    },
+}
+
+/// Where `identity credential add` reads the credential fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The first certificate in this PEM file: the leaf of a chain.
+    Certificate(PathBuf),
+    Fingerprint(CredentialFingerprint),
+}
+
+impl Command {
+    /// Whether this command sends workspace RPC to an owner.
+    pub fn connects_to_owner(&self) -> bool {
+        match self {
+            Self::Workbench { .. }
+            | Self::WorkbenchSession
+            | Self::Materialize { .. }
+            | Self::Collect { .. }
+            | Self::WorkspacePath(_)
+            | Self::OperationStatus { .. }
+            | Self::CommitStatus { .. }
+            | Self::OperationInspect { .. }
+            | Self::OperationRecover { .. } => true,
+            Self::Provision { .. }
+            | Self::Serve
+            | Self::Identity(_)
+            | Self::Schema
+            | Self::Version { .. }
+            | Self::Help => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspacePathCommand {
+    Append {
+        workbench: String,
+        section: String,
+        path: String,
+        operation_id: [u8; 16],
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+        payload: AppendPayload,
+        content_type: Option<String>,
+        max_logical_size: Option<u64>,
+        block_size: usize,
+    },
+    /// Version tokens of one path, read in one metadata read.
+    Stat {
+        workbench: String,
+        section: String,
+        path: String,
+    },
+    /// Create-only or generation-pinned publication of one whole body under
+    /// a caller-chosen operation identity.
+    Put {
+        workbench: String,
+        section: String,
+        path: String,
+        operation_id: [u8; 16],
+        expected_generation: Option<u64>,
+        expected_workspace_incarnation_id: Option<[u8; 16]>,
+        payload: AppendPayload,
+        content_type: Option<String>,
+        block_size: Option<usize>,
+    },
+    Rename {
+        workbench: String,
+        section: String,
+        source: String,
+        destination: String,
+        expected_generation: u64,
+        request_id: [u8; 16],
+    },
+    Remove {
+        workbench: String,
+        section: String,
+        path: String,
+        expected_generation: u64,
+        request_id: [u8; 16],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendPayload {
+    Text(String),
+    Base64(String),
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CliError {
+    MissingValue(String),
+    MissingArgument(&'static str),
+    MissingOption(&'static str),
+    UnknownOption(String),
+    UnknownCommand(String),
+    UnexpectedArgument(String),
+    InvalidNumber {
+        option: &'static str,
+        value: String,
+    },
+    InvalidAddress {
+        option: &'static str,
+        value: String,
+    },
+    InvalidOption {
+        option: &'static str,
+        value: String,
+    },
+    InvalidRequestId(String),
+    OperationInput {
+        operation_id: [u8; 16],
+        message: String,
+    },
+    MixedRoutingOptions,
+    MixedMetadataStoreOptions,
+    LocalOnlyRecoverLog,
+    UnpinnedExpectedGeneration,
+    UnpinnedIdentifiedReplace,
+    UnidentifiedIncarnationFence,
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue(option) => write!(formatter, "missing value for {option}"),
+            Self::MissingArgument(argument) => write!(formatter, "missing {argument}"),
+            Self::MissingOption(option) => write!(formatter, "missing required option {option}"),
+            Self::UnknownOption(option) => write!(formatter, "unknown option {option}"),
+            Self::UnknownCommand(command) => write!(formatter, "unknown command {command}"),
+            Self::UnexpectedArgument(argument) => {
+                write!(formatter, "unexpected argument {argument}")
+            }
+            Self::InvalidNumber { option, value } => {
+                write!(formatter, "{option} has invalid number {value:?}")
+            }
+            Self::InvalidAddress { option, value } => {
+                write!(formatter, "{option} has invalid socket address {value:?}")
+            }
+            Self::InvalidOption { option, value } => {
+                write!(formatter, "{option} has invalid value {value:?}")
+            }
+            Self::InvalidRequestId(value) => write!(
+                formatter,
+                "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
+            ),
+            Self::OperationInput { message, .. } => formatter.write_str(message),
+            Self::MixedRoutingOptions => formatter.write_str(
+                "static metadata routing, etcd routing, and --control-dir cannot be combined",
+            ),
+            Self::MixedMetadataStoreOptions => formatter
+                .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
+            Self::LocalOnlyRecoverLog => formatter.write_str(
+                "--metadata-recover-log installs a shared-log frontier and cannot be combined with --recovery-publication local-only",
+            ),
+            Self::UnpinnedExpectedGeneration => formatter.write_str(
+                "--expected-generation pins a replace-only publication and requires --replace",
+            ),
+            Self::UnpinnedIdentifiedReplace => formatter.write_str(
+                "--replace with --operation-id requires --expected-generation: a caller-identified replace names the generation it replaces",
+            ),
+            Self::UnidentifiedIncarnationFence => formatter.write_str(
+                "--expected-workspace-incarnation-id requires --operation-id",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            root_id: None,
+            routing: RoutingConfig::Static(StaticRoutingConfig::default()),
+            max_attempts: 3,
+            retry_backoff_ms: 0,
+            max_retry_backoff_ms: DEFAULT_MAX_RETRY_BACKOFF_MILLIS,
+            max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+            object: ObjectConfig::default(),
+            tls: None,
+        }
+    }
+}
+
+impl Default for StaticRoutingConfig {
+    fn default() -> Self {
+        Self {
+            metadata_address: DEFAULT_METADATA_ADDRESS
+                .parse()
+                .expect("default metadata address is valid"),
+            logical_shard_id: None,
+            object_namespace_id: None,
+            placement_generation: None,
+            owner_epoch: None,
+        }
+    }
+}
+
+impl Default for EtcdRoutingConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            key_prefix: DEFAULT_ETCD_KEY_PREFIX.to_owned(),
+            lease_ttl_seconds: DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            tls: None,
+        }
+    }
+}
+
+impl Default for ObjectConfig {
+    fn default() -> Self {
+        Self {
+            bucket: None,
+            root: "/".to_owned(),
+            region: "us-east-1".to_owned(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            virtual_host_style: false,
+            skip_signature: false,
+            hot_cache_dir: None,
+            hot_cache_bytes: 0,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: DEFAULT_SERVER_BIND
+                .parse()
+                .expect("default server bind is valid"),
+            handshake_timeout_millis: DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
+            max_inflight_connections: DEFAULT_MAX_INFLIGHT_CONNECTIONS,
+            advertise_endpoint: None,
+            node_id: None,
+            metadata_store: None,
+            lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
+            append_activity_lease_ms: DEFAULT_APPEND_ACTIVITY_LEASE_MS,
+            recovery_publication: RecoveryPublicationConfig::LocalOnly,
+            tls: None,
+            audit_log: None,
+        }
+    }
+}
+
+pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, CliError> {
+    let mut arguments = arguments.into_iter();
+    let mut client = ClientConfig::default();
+    let mut server = ServerConfig::default();
+    let mut recovery_publication_explicit = false;
+    let mut append_activity_lease_explicit = false;
+    let mut static_routing = StaticRoutingConfig::default();
+    let mut etcd_routing = EtcdRoutingConfig::default();
+    let mut etcd_tls_ca = None;
+    let mut etcd_tls_cert = None;
+    let mut etcd_tls_key = None;
+    let mut control_directory = None;
+    let mut routing_kind = None;
+    let mut agent_id = None;
+    let mut rpc_tls = RpcTlsArguments::default();
+    let command = loop {
+        let Some(argument) = arguments.next() else {
+            break Command::Help;
+        };
+        if !argument.starts_with("--") {
+            break parse_command(argument, &mut arguments)?;
+        }
+        match argument.as_str() {
+            "--metadata-address" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.metadata_address =
+                    parse_address("--metadata-address", next_value(&mut arguments, &argument)?)?;
+            }
+            "--root-id" => client.root_id = Some(next_value(&mut arguments, &argument)?),
+            "--agent-id" => agent_id = Some(next_value(&mut arguments, &argument)?),
+            "--logical-shard-id" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.logical_shard_id = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-namespace-id" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.object_namespace_id = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--placement-generation" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.placement_generation = Some(parse_number(
+                    "--placement-generation",
+                    next_value(&mut arguments, &argument)?,
+                )?);
+            }
+            "--owner-epoch" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.owner_epoch = Some(parse_number(
+                    "--owner-epoch",
+                    next_value(&mut arguments, &argument)?,
+                )?);
+            }
+            "--etcd-endpoint" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                etcd_routing
+                    .endpoints
+                    .push(next_value(&mut arguments, &argument)?);
+            }
+            "--etcd-key-prefix" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                etcd_routing.key_prefix = next_value(&mut arguments, &argument)?;
+            }
+            "--etcd-tls-ca" | "--etcd-tls-cert" | "--etcd-tls-key" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                let slot = match argument.as_str() {
+                    "--etcd-tls-ca" => &mut etcd_tls_ca,
+                    "--etcd-tls-cert" => &mut etcd_tls_cert,
+                    _ => &mut etcd_tls_key,
+                };
+                if slot.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                *slot = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--control-dir" => {
+                select_routing(&mut routing_kind, RoutingKind::Local)?;
+                control_directory = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--etcd-lease-ttl-seconds" => {
+                select_routing(&mut routing_kind, RoutingKind::Etcd)?;
+                etcd_routing.lease_ttl_seconds = parse_number(
+                    "--etcd-lease-ttl-seconds",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--max-attempts" => {
+                client.max_attempts =
+                    parse_number("--max-attempts", next_value(&mut arguments, &argument)?)?;
+            }
+            "--retry-backoff-ms" => {
+                client.retry_backoff_ms =
+                    parse_number("--retry-backoff-ms", next_value(&mut arguments, &argument)?)?;
+            }
+            "--max-retry-backoff-ms" => {
+                client.max_retry_backoff_ms = parse_number(
+                    "--max-retry-backoff-ms",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--max-artifact-bytes" => {
+                client.max_artifact_bytes = parse_number(
+                    "--max-artifact-bytes",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--object-bucket" => {
+                client.object.bucket = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-root" => client.object.root = next_value(&mut arguments, &argument)?,
+            "--object-region" => client.object.region = next_value(&mut arguments, &argument)?,
+            "--object-endpoint" => {
+                client.object.endpoint = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-access-key-id" => {
+                client.object.access_key_id = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-secret-access-key" => {
+                client.object.secret_access_key = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-session-token" => {
+                client.object.session_token = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-virtual-host-style" => client.object.virtual_host_style = true,
+            "--object-skip-signature" => client.object.skip_signature = true,
+            "--hot-cache-dir" => {
+                client.object.hot_cache_dir =
+                    Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--hot-cache-bytes" => {
+                client.object.hot_cache_bytes =
+                    parse_number("--hot-cache-bytes", next_value(&mut arguments, &argument)?)?;
+            }
+            "--bind" => {
+                server.bind = parse_address("--bind", next_value(&mut arguments, &argument)?)?;
+            }
+            "--append-activity-lease-ms" => {
+                let value = next_value(&mut arguments, &argument)?;
+                server.append_activity_lease_ms =
+                    parse_number("--append-activity-lease-ms", value.clone())?;
+                if !(1_000..=nokv_server::MAX_APPEND_ACTIVITY_LEASE_MS)
+                    .contains(&server.append_activity_lease_ms)
+                {
+                    return Err(CliError::InvalidOption {
+                        option: "--append-activity-lease-ms",
+                        value,
+                    });
+                }
+                append_activity_lease_explicit = true;
+            }
+            "--handshake-timeout-millis" => {
+                server.handshake_timeout_millis = parse_number(
+                    "--handshake-timeout-millis",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--max-inflight-connections" => {
+                server.max_inflight_connections = parse_number(
+                    "--max-inflight-connections",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--advertise-endpoint" => {
+                // Clients connect to the published route as a socket address
+                // and do not resolve host names, so refuse anything else here
+                // rather than publish a route no client can use.
+                let endpoint = next_value(&mut arguments, &argument)?;
+                parse_address("--advertise-endpoint", endpoint.clone())?;
+                server.advertise_endpoint = Some(endpoint);
+            }
+            "--node-id" => server.node_id = Some(next_value(&mut arguments, &argument)?),
+            "--metadata-create" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::Create(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
+            "--metadata-reopen" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::Reopen(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
+            "--metadata-recover-log" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::RecoverLog(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
+            "--lifecycle-interval-millis" => {
+                server.lifecycle_interval_millis = parse_number(
+                    "--lifecycle-interval-millis",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--recovery-publication" => {
+                let value = next_value(&mut arguments, &argument)?;
+                recovery_publication_explicit = true;
+                server.recovery_publication = match value.as_str() {
+                    "shared" => RecoveryPublicationConfig::Shared,
+                    "local-only" => RecoveryPublicationConfig::LocalOnly,
+                    _ => {
+                        return Err(CliError::InvalidOption {
+                            option: "--recovery-publication",
+                            value,
+                        });
+                    }
+                };
+            }
+            "--rpc-tls-ca" => {
+                rpc_tls.server_roots = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-cert" => {
+                rpc_tls.certificate = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-key" => {
+                rpc_tls.key = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--rpc-tls-server-name" => {
+                rpc_tls.server_name = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--audit-log" => {
+                server.audit_log = Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+            }
+            "--help" => break Command::Help,
+            "--version" => break Command::Version { json: false },
+            _ => return Err(CliError::UnknownOption(argument)),
+        }
+    };
+    if matches!(
+        server.metadata_store,
+        Some(MetadataStoreConfig::RecoverLog(_))
+    ) {
+        // A shared-log successor resumes from a shared frontier, so shared
+        // publication is the only coherent choice: imply it when the caller
+        // said nothing, refuse it when the caller asked for local-only.
+        match (recovery_publication_explicit, server.recovery_publication) {
+            (false, _) => server.recovery_publication = RecoveryPublicationConfig::Shared,
+            (true, RecoveryPublicationConfig::LocalOnly) => {
+                return Err(CliError::LocalOnlyRecoverLog);
+            }
+            (true, RecoveryPublicationConfig::Shared) => {}
+        }
+    }
+    client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
+        RoutingKind::Static => RoutingConfig::Static(static_routing),
+        RoutingKind::Etcd => {
+            etcd_routing.tls = etcd_tls_files(etcd_tls_ca, etcd_tls_cert, etcd_tls_key)?;
+            RoutingConfig::Etcd(etcd_routing)
+        }
+        RoutingKind::Local => RoutingConfig::Local(LocalRoutingConfig {
+            directory: control_directory.ok_or(CliError::MissingOption("--control-dir"))?,
+        }),
+    };
+    if let Some(argument) = arguments.next() {
+        return Err(CliError::UnexpectedArgument(argument));
+    }
+    match rpc_tls.for_command(&command)? {
+        RpcTlsRole::None => {}
+        RpcTlsRole::Client(tls) => client.tls = Some(tls),
+        RpcTlsRole::Server(tls) => server.tls = Some(tls),
+    }
+    if append_activity_lease_explicit && !matches!(command, Command::Serve) {
+        return Err(CliError::UnexpectedArgument(
+            "--append-activity-lease-ms is only valid with serve".to_owned(),
+        ));
+    }
+    if server.audit_log.is_some() && server.tls.is_none() {
+        return Err(CliError::UnexpectedArgument(
+            "--audit-log records the refusals of a TLS owner: it is only valid with serve, \
+             --rpc-tls-cert and --rpc-tls-key"
+                .to_owned(),
+        ));
+    }
+    if matches!(
+        &command,
+        Command::Workbench { .. }
+            | Command::WorkbenchSession
+            | Command::Materialize { .. }
+            | Command::Collect { .. }
+            | Command::WorkspacePath(_)
+            | Command::OperationStatus { .. }
+            | Command::CommitStatus { .. }
+            | Command::OperationInspect { .. }
+            | Command::OperationRecover { .. }
+            | Command::Provision { .. }
+    ) && agent_id.is_none()
+        // Over RPC TLS the owner authorizes the principal; no AgentId binds.
+        && client.tls.is_none()
+    {
+        return Err(CliError::MissingOption("--agent-id"));
+    }
+    if client.retry_backoff_ms > client.max_retry_backoff_ms {
+        return Err(CliError::InvalidOption {
+            option: "--retry-backoff-ms",
+            value: client.retry_backoff_ms.to_string(),
+        });
+    }
+    Ok(Invocation {
+        client,
+        server,
+        agent_id,
+        command,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutingKind {
+    Static,
+    Etcd,
+    Local,
+}
+
+/// The three etcd TLS files are given together or not at all.
+fn etcd_tls_files(
+    trusted_ca: Option<PathBuf>,
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Option<EtcdTlsFiles>, CliError> {
+    if trusted_ca.is_none() && certificate.is_none() && key.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EtcdTlsFiles {
+        trusted_ca: trusted_ca.ok_or(CliError::MissingOption("--etcd-tls-ca"))?,
+        certificate: certificate.ok_or(CliError::MissingOption("--etcd-tls-cert"))?,
+        key: key.ok_or(CliError::MissingOption("--etcd-tls-key"))?,
+    }))
+}
+
+fn select_routing(
+    selected: &mut Option<RoutingKind>,
+    requested: RoutingKind,
+) -> Result<(), CliError> {
+    match *selected {
+        Some(current) if current != requested => Err(CliError::MixedRoutingOptions),
+        Some(_) => Ok(()),
+        None => {
+            *selected = Some(requested);
+            Ok(())
+        }
+    }
+}
+
+fn select_metadata_store(
+    selected: &mut Option<MetadataStoreConfig>,
+    requested: MetadataStoreConfig,
+) -> Result<(), CliError> {
+    if selected.is_some() {
+        return Err(CliError::MixedMetadataStoreOptions);
+    }
+    *selected = Some(requested);
+    Ok(())
+}
+
+/// `--rpc-tls-*` options as given, before the command decides their role.
+#[derive(Default)]
+struct RpcTlsArguments {
+    server_roots: Option<PathBuf>,
+    certificate: Option<PathBuf>,
+    key: Option<PathBuf>,
+    server_name: Option<String>,
+}
+
+enum RpcTlsRole {
+    None,
+    Client(ClientTlsConfig),
+    Server(ServerTlsConfig),
+}
+
+impl RpcTlsArguments {
+    /// A command that connects to an owner needs all four options, `serve`
+    /// its certificate and key only, and any other command none.
+    fn for_command(self, command: &Command) -> Result<RpcTlsRole, CliError> {
+        let given = self.server_roots.is_some()
+            || self.certificate.is_some()
+            || self.key.is_some()
+            || self.server_name.is_some();
+        if !given {
+            return Ok(RpcTlsRole::None);
+        }
+        if matches!(command, Command::Serve) {
+            for (unused, option) in [
+                (self.server_roots.is_some(), "--rpc-tls-ca"),
+                (self.server_name.is_some(), "--rpc-tls-server-name"),
+            ] {
+                if unused {
+                    return Err(CliError::UnexpectedArgument(format!(
+                        "{option} is only valid with commands that connect to an owner"
+                    )));
+                }
+            }
+            return Ok(RpcTlsRole::Server(ServerTlsConfig {
+                certificate: self
+                    .certificate
+                    .ok_or(CliError::MissingOption("--rpc-tls-cert"))?,
+                key: self.key.ok_or(CliError::MissingOption("--rpc-tls-key"))?,
+            }));
+        }
+        if !command.connects_to_owner() {
+            return Err(CliError::UnexpectedArgument(
+                "--rpc-tls-* options are only valid with serve and commands that connect to an \
+                 owner"
+                    .to_owned(),
+            ));
+        }
+        Ok(RpcTlsRole::Client(ClientTlsConfig {
+            server_roots: self
+                .server_roots
+                .ok_or(CliError::MissingOption("--rpc-tls-ca"))?,
+            certificate: self
+                .certificate
+                .ok_or(CliError::MissingOption("--rpc-tls-cert"))?,
+            key: self.key.ok_or(CliError::MissingOption("--rpc-tls-key"))?,
+            server_name: self
+                .server_name
+                .ok_or(CliError::MissingOption("--rpc-tls-server-name"))?,
+        }))
+    }
+}
+
+fn parse_command(
+    command: String,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Command, CliError> {
+    match command.as_str() {
+        "workbench" => Ok(Command::Workbench {
+            tool: arguments
+                .next()
+                .ok_or(CliError::MissingArgument("Workbench tool name"))?,
+            arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
+        }),
+        "workbench-session" => Ok(Command::WorkbenchSession),
+        "materialize" => Ok(Command::Materialize {
+            workbench: arguments
+                .next()
+                .ok_or(CliError::MissingArgument("workbench id"))?,
+            section: arguments
+                .next()
+                .ok_or(CliError::MissingArgument("section"))?,
+            path: arguments
+                .next()
+                .ok_or(CliError::MissingArgument("workspace path"))?,
+            destination: PathBuf::from(
+                arguments
+                    .next()
+                    .ok_or(CliError::MissingArgument("local destination"))?,
+            ),
+        }),
+        "collect" => parse_collect(arguments),
+        "workspace-path" => parse_workspace_path(arguments),
+        "operation" => parse_operation(arguments),
+        "provision" => parse_provision(arguments),
+        "identity" => parse_identity(arguments).map(Command::Identity),
+        "serve" => Ok(Command::Serve),
+        "schema" => Ok(Command::Schema),
+        "version" => parse_version(arguments),
+        "help" => Ok(Command::Help),
+        _ => Err(CliError::UnknownCommand(command)),
+    }
+}
+
+fn parse_operation(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let operation = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation command"))?;
+    if !matches!(operation.as_str(), "status" | "inspect" | "recover") {
+        return Err(CliError::UnknownCommand(format!("operation {operation}")));
+    }
+    let identity = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("operation identity"))?;
+    if operation == "status" && identity == "--commit-identity" {
+        let value = arguments
+            .next()
+            .ok_or(CliError::MissingArgument("commit identity"))?;
+        let commit_identity = decode_fixed_hex(&value).ok_or(CliError::InvalidOption {
+            option: "--commit-identity",
+            value,
+        })?;
+        if let Some(argument) = arguments.next() {
+            return Err(CliError::UnexpectedArgument(argument));
+        }
+        return Ok(Command::CommitStatus { commit_identity });
+    }
+    let operation_id = parse_append_identity("operation identity", identity)?;
+    if operation == "status" {
+        return Ok(Command::OperationStatus { operation_id });
+    }
+    parse_operation_options(&operation, operation_id, arguments).map_err(|error| {
+        CliError::OperationInput {
+            operation_id,
+            message: error.to_string(),
+        }
+    })
+}
+
+fn parse_operation_options(
+    operation: &str,
+    operation_id: [u8; 16],
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Command, CliError> {
+    let mut limit = None;
+    let mut cursor = None;
+    let mut expected_state_digest = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--limit" if operation == "inspect" && limit.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let parsed = parse_number::<u32>("--limit", value.clone())?;
+                if !(1..=nokv_client::MAX_APPEND_INSPECTION_LIMIT).contains(&parsed) {
+                    return Err(CliError::InvalidOption {
+                        option: "--limit",
+                        value,
+                    });
+                }
+                limit = Some(parsed);
+            }
+            "--cursor" if operation == "inspect" && cursor.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                let maximum = nokv_protocol::PageRequest::MAX_CURSOR_BYTES;
+                if value.len() > maximum.div_ceil(3) * 4 {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                let decoded = STANDARD
+                    .decode(&value)
+                    .map_err(|_| CliError::InvalidOption {
+                        option: "--cursor",
+                        value: value.clone(),
+                    })?;
+                if decoded.len() > maximum {
+                    return Err(CliError::InvalidOption {
+                        option: "--cursor",
+                        value,
+                    });
+                }
+                cursor = Some(decoded);
+            }
+            "--expected-state-digest"
+                if operation == "recover" && expected_state_digest.is_none() =>
+            {
+                let value = next_value(arguments, &argument)?;
+                expected_state_digest =
+                    Some(decode_fixed_hex(&value).ok_or(CliError::InvalidOption {
+                        option: "--expected-state-digest",
+                        value,
+                    })?);
+            }
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    if operation == "inspect" {
+        Ok(Command::OperationInspect {
+            operation_id,
+            limit: limit.unwrap_or(nokv_client::DEFAULT_APPEND_INSPECTION_LIMIT),
+            cursor,
+        })
+    } else {
+        Ok(Command::OperationRecover {
+            operation_id,
+            expected_state_digest,
+        })
+    }
+}
+
+fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let operation = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workspace-path operation"))?;
+    let workbench = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workbench id"))?;
+    let section = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("section"))?;
+    let first_path = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workspace path"))?;
+    if operation == "append" {
+        return parse_workspace_append(arguments, workbench, section, first_path);
+    }
+    if operation == "put" {
+        return parse_workspace_put(arguments, workbench, section, first_path);
+    }
+    if operation == "stat" {
+        if let Some(argument) = arguments.next() {
+            return Err(CliError::UnexpectedArgument(argument));
+        }
+        return Ok(Command::WorkspacePath(WorkspacePathCommand::Stat {
+            workbench,
+            section,
+            path: first_path,
+        }));
+    }
+    let destination = match operation.as_str() {
+        "rename" => Some(
+            arguments
+                .next()
+                .ok_or(CliError::MissingArgument("destination workspace path"))?,
+        ),
+        "remove" => None,
+        _ => {
+            return Err(CliError::UnknownCommand(format!(
+                "workspace-path {operation}"
+            )));
+        }
+    };
+
+    let mut expected_generation = None;
+    let mut request_id = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--expected-generation" if expected_generation.is_none() => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--request-id" if request_id.is_none() => {
+                request_id = Some(parse_request_id(next_value(arguments, &argument)?)?);
+            }
+            "--expected-generation" | "--request-id" => {
+                return Err(CliError::UnexpectedArgument(argument));
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    let expected_generation =
+        expected_generation.ok_or(CliError::MissingOption("--expected-generation"))?;
+    let request_id = request_id.ok_or(CliError::MissingOption("--request-id"))?;
+
+    Ok(Command::WorkspacePath(match destination {
+        Some(destination) => WorkspacePathCommand::Rename {
+            workbench,
+            section,
+            source: first_path,
+            destination,
+            expected_generation,
+            request_id,
+        },
+        None => WorkspacePathCommand::Remove {
+            workbench,
+            section,
+            path: first_path,
+            expected_generation,
+            request_id,
+        },
+    }))
+}
+
+fn parse_workspace_put(
+    arguments: &mut impl Iterator<Item = String>,
+    workbench: String,
+    section: String,
+    path: String,
+) -> Result<Command, CliError> {
+    let mut operation_id = None;
+    let mut expected_generation = None;
+    let mut expected_workspace_incarnation_id = None;
+    let mut payload = None;
+    let mut content_type = None;
+    let mut block_size = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-generation" if expected_generation.is_none() => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--text" if payload.is_none() => {
+                payload = Some(AppendPayload::Text(next_value(arguments, &argument)?));
+            }
+            "--base64" if payload.is_none() => {
+                payload = Some(AppendPayload::Base64(next_value(arguments, &argument)?));
+            }
+            "--file" if payload.is_none() => {
+                payload = Some(AppendPayload::File(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--block-size" if block_size.is_none() => {
+                block_size = Some(parse_number(
+                    "--block-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--operation-id"
+            | "--expected-generation"
+            | "--expected-workspace-incarnation-id"
+            | "--text"
+            | "--base64"
+            | "--file"
+            | "--content-type"
+            | "--block-size" => return Err(CliError::UnexpectedArgument(argument)),
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::WorkspacePath(WorkspacePathCommand::Put {
+        workbench,
+        section,
+        path,
+        operation_id: operation_id.ok_or(CliError::MissingOption("--operation-id"))?,
+        expected_generation,
+        expected_workspace_incarnation_id,
+        payload: payload.ok_or(CliError::MissingArgument(
+            "one of --text, --base64, or --file",
+        ))?,
+        content_type,
+        block_size,
+    }))
+}
+
+fn parse_workspace_append(
+    arguments: &mut impl Iterator<Item = String>,
+    workbench: String,
+    section: String,
+    path: String,
+) -> Result<Command, CliError> {
+    let mut operation_id = None;
+    let mut expected_workspace_incarnation_id = None;
+    let mut payload = None;
+    let mut content_type = None;
+    let mut max_logical_size = None;
+    let mut block_size = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--text" if payload.is_none() => {
+                payload = Some(AppendPayload::Text(next_value(arguments, &argument)?));
+            }
+            "--base64" if payload.is_none() => {
+                payload = Some(AppendPayload::Base64(next_value(arguments, &argument)?));
+            }
+            "--file" if payload.is_none() => {
+                payload = Some(AppendPayload::File(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--max-logical-size" if max_logical_size.is_none() => {
+                max_logical_size = Some(parse_number(
+                    "--max-logical-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--block-size" if block_size.is_none() => {
+                block_size = Some(parse_number(
+                    "--block-size",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--operation-id"
+            | "--expected-workspace-incarnation-id"
+            | "--text"
+            | "--base64"
+            | "--file"
+            | "--content-type"
+            | "--max-logical-size"
+            | "--block-size" => return Err(CliError::UnexpectedArgument(argument)),
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::WorkspacePath(WorkspacePathCommand::Append {
+        workbench,
+        section,
+        path,
+        operation_id: operation_id.ok_or(CliError::MissingOption("--operation-id"))?,
+        expected_workspace_incarnation_id,
+        payload: payload.ok_or(CliError::MissingArgument(
+            "one of --text, --base64, or --file",
+        ))?,
+        content_type,
+        max_logical_size,
+        block_size: block_size.unwrap_or(nokv_object::DEFAULT_ARTIFACT_BLOCK_SIZE),
+    }))
+}
+
+fn parse_append_identity(option: &'static str, value: String) -> Result<[u8; 16], CliError> {
+    parse_request_id(value.clone()).map_err(|_| CliError::InvalidOption { option, value })
+}
+
+fn parse_identity(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<IdentityCommand, CliError> {
+    let noun = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("identity subcommand"))?;
+    let command = match noun.as_str() {
+        "show" => IdentityCommand::Show {
+            tenant_id: identity_argument(arguments, "tenant id")?,
+        },
+        "tenant" => match identity_action(arguments, &noun)?.as_str() {
+            "create" => IdentityCommand::CreateTenant {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+            },
+            other => return Err(CliError::UnknownCommand(format!("identity tenant {other}"))),
+        },
+        "principal" => match identity_action(arguments, &noun)?.as_str() {
+            "create" => IdentityCommand::CreatePrincipal {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+                principal_id: identity_argument(arguments, "principal id")?,
+            },
+            other => {
+                return Err(CliError::UnknownCommand(format!(
+                    "identity principal {other}"
+                )))
+            }
+        },
+        "credential" => match identity_action(arguments, &noun)?.as_str() {
+            "add" => parse_credential_add(arguments)?,
+            "revoke" => IdentityCommand::RevokeCredential {
+                tenant_id: identity_argument(arguments, "tenant id")?,
+                fingerprint: identity_argument(arguments, "credential fingerprint")?,
+            },
+            other => {
+                return Err(CliError::UnknownCommand(format!(
+                    "identity credential {other}"
+                )))
+            }
+        },
+        "role" => match identity_action(arguments, &noun)?.as_str() {
+            "grant" => IdentityCommand::GrantRole(parse_role_binding(arguments)?),
+            "revoke" => IdentityCommand::RevokeRole(parse_role_binding(arguments)?),
+            other => return Err(CliError::UnknownCommand(format!("identity role {other}"))),
+        },
+        "root" => match identity_action(arguments, &noun)?.as_str() {
+            "bind" => IdentityCommand::BindRoot {
+                root_id: identity_argument(arguments, "root id")?,
+                tenant_id: identity_argument(arguments, "tenant id")?,
+            },
+            other => return Err(CliError::UnknownCommand(format!("identity root {other}"))),
+        },
+        other => return Err(CliError::UnknownCommand(format!("identity {other}"))),
+    };
+    Ok(command)
+}
+
+fn identity_action(
+    arguments: &mut impl Iterator<Item = String>,
+    noun: &str,
+) -> Result<String, CliError> {
+    arguments
+        .next()
+        .ok_or_else(|| CliError::UnknownCommand(format!("identity {noun}")))
+}
+
+/// A positional lowercase-hex identity: 32 digits, or 64 for a fingerprint.
+fn identity_argument<T: FixedHexIdentity>(
+    arguments: &mut impl Iterator<Item = String>,
+    name: &'static str,
+) -> Result<T, CliError> {
+    let value = arguments.next().ok_or(CliError::MissingArgument(name))?;
+    T::from_hex(&value).ok_or(CliError::InvalidOption {
+        option: name,
+        value,
+    })
+}
+
+trait FixedHexIdentity: Sized {
+    fn from_hex(value: &str) -> Option<Self>;
+}
+
+macro_rules! fixed_hex_identity {
+    ($($name:ident),+) => {
+        $(impl FixedHexIdentity for $name {
+            fn from_hex(value: &str) -> Option<Self> {
+                decode_fixed_hex(value).map(Self::from_bytes)
+            }
+        })+
+    };
+}
+
+fixed_hex_identity!(TenantId, PrincipalId, RootId, CredentialFingerprint);
+
+fn parse_credential_add(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<IdentityCommand, CliError> {
+    let tenant_id = identity_argument(arguments, "tenant id")?;
+    let principal_id = identity_argument(arguments, "principal id")?;
+    let mut credential = None;
+    let mut expires_at_unix_seconds = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--certificate" if credential.is_none() => {
+                credential = Some(CredentialSource::Certificate(PathBuf::from(next_value(
+                    arguments, &argument,
+                )?)));
+            }
+            "--fingerprint" if credential.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                credential = Some(CredentialSource::Fingerprint(
+                    CredentialFingerprint::from_hex(&value).ok_or(CliError::InvalidOption {
+                        option: "--fingerprint",
+                        value,
+                    })?,
+                ));
+            }
+            "--expires-at-unix" if expires_at_unix_seconds.is_none() => {
+                expires_at_unix_seconds = Some(parse_number(
+                    "--expires-at-unix",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--certificate" | "--fingerprint" | "--expires-at-unix" => {
+                return Err(CliError::UnexpectedArgument(argument))
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(IdentityCommand::AddCredential {
+        tenant_id,
+        principal_id,
+        credential: credential.ok_or(CliError::MissingOption("--certificate or --fingerprint"))?,
+        expires_at_unix_seconds: expires_at_unix_seconds
+            .ok_or(CliError::MissingOption("--expires-at-unix"))?,
+    })
+}
+
+fn parse_role_binding(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<RoleBinding, CliError> {
+    let tenant_id = identity_argument(arguments, "tenant id")?;
+    let principal_id = identity_argument(arguments, "principal id")?;
+    let mut role = None;
+    let mut scope = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--role" if role.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                role = Some(
+                    Role::ALL
+                        .into_iter()
+                        .find(|role| role.name() == value)
+                        .ok_or(CliError::InvalidOption {
+                            option: "--role",
+                            value,
+                        })?,
+                );
+            }
+            "--tenant-wide" if scope.is_none() => scope = Some(RoleScope::Tenant),
+            "--root" if scope.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                scope = Some(RoleScope::Root(RootId::from_hex(&value).ok_or(
+                    CliError::InvalidOption {
+                        option: "--root",
+                        value,
+                    },
+                )?));
+            }
+            "--role" | "--tenant-wide" | "--root" => {
+                return Err(CliError::UnexpectedArgument(argument))
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(RoleBinding {
+        tenant_id,
+        principal_id,
+        role: role.ok_or(CliError::MissingOption("--role"))?,
+        scope: scope.ok_or(CliError::MissingOption("--tenant-wide or --root"))?,
+    })
+}
+
+fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let logical_shard_id = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("logical shard id"))?;
+    let mut workbench_root = None;
+    let mut adopt_legacy_object_namespace = false;
+    let mut adopt_legacy_agent_binding = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--workbench-root" => workbench_root = Some(next_value(arguments, &argument)?),
+            "--adopt-legacy-object-namespace" => adopt_legacy_object_namespace = true,
+            "--adopt-legacy-agent-binding" => adopt_legacy_agent_binding = true,
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::Provision {
+        logical_shard_id,
+        workbench_root: workbench_root.ok_or(CliError::MissingOption("--workbench-root"))?,
+        adopt_legacy_object_namespace,
+        adopt_legacy_agent_binding,
+    })
+}
+
+fn parse_version(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    match arguments.next() {
+        None => Ok(Command::Version { json: false }),
+        Some(argument) if argument == "--json" => Ok(Command::Version { json: true }),
+        Some(argument) if argument.starts_with("--") => Err(CliError::UnknownOption(argument)),
+        Some(argument) => Err(CliError::UnexpectedArgument(argument)),
+    }
+}
+
+fn parse_collect(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let workbench = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workbench id"))?;
+    let section = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("section"))?;
+    let source = PathBuf::from(
+        arguments
+            .next()
+            .ok_or(CliError::MissingArgument("local source"))?,
+    );
+    let path = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workspace path"))?;
+    let mut replace = false;
+    let mut expected_generation = None;
+    let mut content_type = None;
+    let mut operation_id = None;
+    let mut expected_workspace_incarnation_id = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--replace" if !replace => replace = true,
+            "--expected-generation" if expected_generation.is_none() => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--content-type" if content_type.is_none() => {
+                content_type = Some(next_value(arguments, &argument)?);
+            }
+            "--operation-id" if operation_id.is_none() => {
+                operation_id = Some(parse_append_identity(
+                    "--operation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--expected-workspace-incarnation-id"
+                if expected_workspace_incarnation_id.is_none() =>
+            {
+                expected_workspace_incarnation_id = Some(parse_append_identity(
+                    "--expected-workspace-incarnation-id",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--replace"
+            | "--expected-generation"
+            | "--content-type"
+            | "--operation-id"
+            | "--expected-workspace-incarnation-id" => {
+                return Err(CliError::UnexpectedArgument(argument));
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    if expected_generation.is_some() && !replace {
+        return Err(CliError::UnpinnedExpectedGeneration);
+    }
+    if operation_id.is_some() && replace && expected_generation.is_none() {
+        return Err(CliError::UnpinnedIdentifiedReplace);
+    }
+    if operation_id.is_none() && expected_workspace_incarnation_id.is_some() {
+        return Err(CliError::UnidentifiedIncarnationFence);
+    }
+    Ok(Command::Collect {
+        workbench,
+        section,
+        source,
+        path,
+        replace,
+        expected_generation,
+        content_type,
+        operation_id,
+        expected_workspace_incarnation_id,
+    })
+}
+
+fn next_value(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, CliError> {
+    arguments
+        .next()
+        .ok_or_else(|| CliError::MissingValue(option.to_owned()))
+}
+
+fn parse_number<T>(option: &'static str, value: String) -> Result<T, CliError>
+where
+    T: FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidNumber { option, value })
+}
+
+fn parse_address(option: &'static str, value: String) -> Result<SocketAddr, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidAddress { option, value })
+}
+
+fn parse_request_id(value: String) -> Result<[u8; 16], CliError> {
+    decode_fixed_hex(&value).ok_or(CliError::InvalidRequestId(value))
+}
+
+fn decode_fixed_hex<const WIDTH: usize>(value: &str) -> Option<[u8; WIDTH]> {
+    if value.len() != WIDTH * 2
+        || !value
+            .as_bytes()
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut decoded = [0_u8; WIDTH];
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("parse_request_id validates lowercase hexadecimal bytes"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn workbench_session_requires_the_same_identity() {
+        assert_eq!(
+            parse(args(&["workbench-session"])),
+            Err(CliError::MissingOption("--agent-id"))
+        );
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.command, Command::WorkbenchSession);
+    }
+
+    #[test]
+    fn parses_root_routed_workbench_call() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "01",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--logical-shard-id",
+            "02",
+            "--placement-generation",
+            "7",
+            "--owner-epoch",
+            "9",
+            "--object-bucket",
+            "artifacts",
+            "workbench",
+            "workbench_create",
+            r#"{"id":"run-1"}"#,
+        ]))
+        .unwrap();
+        assert_eq!(parsed.client.root_id.as_deref(), Some("01"));
+        assert_eq!(
+            parsed.agent_id.as_deref(),
+            Some("44444444444444444444444444444444")
+        );
+        let RoutingConfig::Static(route) = parsed.client.routing else {
+            panic!("static route expected");
+        };
+        assert_eq!(route.logical_shard_id.as_deref(), Some("02"));
+        assert_eq!(route.placement_generation, Some(7));
+        assert_eq!(route.owner_epoch, Some(9));
+        assert_eq!(
+            parsed.command,
+            Command::Workbench {
+                tool: "workbench_create".to_owned(),
+                arguments: r#"{"id":"run-1"}"#.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn collect_is_explicit_local_transfer() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
+            "--replace",
+            "--content-type",
+            "application/octet-stream",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::Collect {
+                workbench: "run-1".to_owned(),
+                section: "outputs".to_owned(),
+                source: PathBuf::from("/tmp/result.bin"),
+                path: "result.bin".to_owned(),
+                replace: true,
+                expected_generation: None,
+                content_type: Some("application/octet-stream".to_owned()),
+                operation_id: None,
+                expected_workspace_incarnation_id: None,
+            }
+        );
+    }
+
+    fn agent_args(rest: &[&str]) -> Vec<String> {
+        let mut all = vec!["--agent-id", "44444444444444444444444444444444"];
+        all.extend_from_slice(rest);
+        args(&all)
+    }
+
+    #[test]
+    fn put_names_one_caller_identified_whole_body_publication() {
+        let parsed = parse(agent_args(&[
+            "workspace-path",
+            "put",
+            "run-1",
+            "outputs",
+            "result.json",
+            "--operation-id",
+            "0123456789abcdef0123456789abcdef",
+            "--text",
+            "{}",
+            "--expected-generation",
+            "2",
+            "--content-type",
+            "application/json",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Put {
+                workbench: "run-1".to_owned(),
+                section: "outputs".to_owned(),
+                path: "result.json".to_owned(),
+                operation_id: [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+                    0xab, 0xcd, 0xef
+                ],
+                expected_generation: Some(2),
+                expected_workspace_incarnation_id: None,
+                payload: AppendPayload::Text("{}".to_owned()),
+                content_type: Some("application/json".to_owned()),
+                block_size: None,
+            })
+        );
+        let put = |rest: &[&str]| {
+            let mut all = vec!["workspace-path", "put", "run-1", "outputs", "a.txt"];
+            all.extend_from_slice(rest);
+            parse(agent_args(&all))
+        };
+        assert_eq!(
+            put(&["--text", "a"]).unwrap_err(),
+            CliError::MissingOption("--operation-id")
+        );
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(matches!(
+            put(&["--operation-id", id]).unwrap_err(),
+            CliError::MissingArgument(_)
+        ));
+        for duplicated in [
+            vec!["--operation-id", id, "--operation-id", id, "--text", "a"],
+            vec!["--operation-id", id, "--text", "a", "--file", "b"],
+            vec![
+                "--operation-id",
+                id,
+                "--text",
+                "a",
+                "--expected-generation",
+                "1",
+                "--expected-generation",
+                "2",
+            ],
+        ] {
+            assert!(matches!(
+                put(&duplicated).unwrap_err(),
+                CliError::UnexpectedArgument(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_identified_collect_pins_its_replace_and_owns_its_fence() {
+        let collect = |rest: &[&str]| {
+            let mut all = vec!["collect", "run-1", "outputs", "/tmp/a.bin", "a.bin"];
+            all.extend_from_slice(rest);
+            parse(agent_args(&all))
+        };
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            collect(&["--operation-id", id, "--replace"]).unwrap_err(),
+            CliError::UnpinnedIdentifiedReplace
+        );
+        assert_eq!(
+            collect(&["--expected-workspace-incarnation-id", id]).unwrap_err(),
+            CliError::UnidentifiedIncarnationFence
+        );
+        for duplicated in [
+            vec!["--replace", "--replace"],
+            vec!["--content-type", "a/b", "--content-type", "c/d"],
+        ] {
+            assert!(matches!(
+                collect(&duplicated).unwrap_err(),
+                CliError::UnexpectedArgument(_)
+            ));
+        }
+        let parsed = collect(&[
+            "--operation-id",
+            id,
+            "--replace",
+            "--expected-generation",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Collect {
+                operation_id: Some(_),
+                expected_generation: Some(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn operation_status_names_a_commit_by_its_reported_identity() {
+        let commit = "ab".repeat(32);
+        let parsed = parse(agent_args(&[
+            "operation",
+            "status",
+            "--commit-identity",
+            &commit,
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::CommitStatus {
+                commit_identity: [0xab; 32]
+            }
+        );
+        assert!(matches!(
+            parse(agent_args(&[
+                "operation",
+                "status",
+                "--commit-identity",
+                "ab"
+            ]))
+            .unwrap_err(),
+            CliError::InvalidOption { .. }
+        ));
+    }
+
+    #[test]
+    fn collect_expected_generation_pins_the_replace_cas() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
+            "--replace",
+            "--expected-generation",
+            "7",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::Collect {
+                workbench: "run-1".to_owned(),
+                section: "outputs".to_owned(),
+                source: PathBuf::from("/tmp/result.bin"),
+                path: "result.bin".to_owned(),
+                replace: true,
+                expected_generation: Some(7),
+                content_type: None,
+                operation_id: None,
+                expected_workspace_incarnation_id: None,
+            }
+        );
+
+        let unpinned = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "collect",
+            "run-1",
+            "outputs",
+            "/tmp/result.bin",
+            "result.bin",
+            "--expected-generation",
+            "7",
+        ]));
+        assert!(
+            unpinned.is_err(),
+            "expected-generation without --replace must fail"
+        );
+    }
+
+    #[test]
+    fn append_activity_lease_is_an_explicit_bounded_server_option() {
+        assert_eq!(
+            parse(args(&["serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1_800_000
+        );
+        assert_eq!(
+            parse(args(&["--append-activity-lease-ms", "1000", "serve"]))
+                .unwrap()
+                .server
+                .append_activity_lease_ms,
+            1000
+        );
+        assert!(parse(args(&["--append-activity-lease-ms", "999", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400001", "serve"])).is_err());
+        assert!(parse(args(&["--append-activity-lease-ms", "86400000", "serve"])).is_ok());
+        assert!(parse(args(&["--append-activity-lease-ms", "1000", "schema"])).is_err());
+    }
+
+    #[test]
+    fn operation_status_needs_only_identity_and_agent_routing() {
+        let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::OperationStatus {
+                operation_id: [0xaa; 16],
+            }
+        );
+        assert!(parsed.client.object.bucket.is_none());
+        assert!(parse(args(&["operation", "status", "aa"])).is_err());
+        assert!(parse(args(&["operation", "status"])).is_err());
+        assert!(parse(args(&["operation", "resume", "aa"])).is_err());
+        assert!(parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "operation",
+            "status",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unexpected",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn operation_inspection_and_recovery_preserve_cursor_and_exact_token() {
+        let parse_command = |tail: &[&str]| {
+            let mut input = vec![
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "operation",
+            ];
+            input.extend_from_slice(tail);
+            parse(args(&input))
+        };
+        let identity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let inspected = parse_command(&["inspect", identity]).unwrap();
+        assert_eq!(
+            inspected.command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 32,
+                cursor: None,
+            }
+        );
+        assert!(inspected.client.object.bucket.is_none());
+        assert_eq!(
+            parse_command(&["inspect", identity, "--limit", "192", "--cursor", "AQID"])
+                .unwrap()
+                .command,
+            Command::OperationInspect {
+                operation_id: [0xaa; 16],
+                limit: 192,
+                cursor: Some(vec![1, 2, 3])
+            }
+        );
+        assert_eq!(
+            parse_command(&["recover", identity]).unwrap().command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: None
+            }
+        );
+        assert_eq!(
+            parse_command(&[
+                "recover",
+                identity,
+                "--expected-state-digest",
+                &"bb".repeat(32)
+            ])
+            .unwrap()
+            .command,
+            Command::OperationRecover {
+                operation_id: [0xaa; 16],
+                expected_state_digest: Some([0xbb; 32])
+            }
+        );
+        for tail in [
+            vec!["inspect", identity, "--limit", "0"],
+            vec!["inspect", identity, "--limit", "193"],
+            vec!["inspect", identity, "--cursor", "%%%"],
+            vec!["inspect", identity, "--limit", "1", "--limit", "2"],
+            vec!["recover", identity, "--expected-state-digest", "aa"],
+            vec!["recover", identity, "--limit", "1"],
+        ] {
+            assert!(
+                matches!(parse_command(&tail), Err(CliError::OperationInput { operation_id, .. }) if operation_id == [0xaa; 16]),
+                "{tail:?}"
+            );
+        }
+        assert!(parse_command(&["inspect", identity, "--cursor", &"A".repeat(6000)]).is_err());
+        assert!(parse_command(&[
+            "recover",
+            identity,
+            "--expected-state-digest",
+            &"BB".repeat(32)
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_append_requires_one_payload_and_stable_identity() {
+        let prefix = ["append", "run-42", "logs", "events.jsonl"];
+        let parse_append = |tail: &[&str]| {
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(tail);
+            parse_workspace_path(&mut args(&input).into_iter())
+        };
+        assert_eq!(
+            parse_append(&["--text", "event"]),
+            Err(CliError::MissingOption("--operation-id"))
+        );
+        assert!(parse_append(&["--operation-id", "ABC", "--text", "event"]).is_err());
+        assert!(parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--text",
+            "event",
+            "--base64",
+            "ZXZlbnQ="
+        ])
+        .is_err());
+        let command = parse_append(&[
+            "--operation-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-workspace-incarnation-id",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--text",
+            "event",
+            "--content-type",
+            "text/plain",
+            "--max-logical-size",
+            "1024",
+            "--block-size",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::WorkspacePath(WorkspacePathCommand::Append {
+                workbench: "run-42".to_owned(),
+                section: "logs".to_owned(),
+                path: "events.jsonl".to_owned(),
+                operation_id: [0xaa; 16],
+                expected_workspace_incarnation_id: Some([0xbb; 16]),
+                payload: AppendPayload::Text("event".to_owned()),
+                content_type: Some("text/plain".to_owned()),
+                max_logical_size: Some(1024),
+                block_size: 1024,
+            })
+        );
+        for payload in [["--base64", "ZXZlbnQ="], ["--file", "/tmp/delta.bin"]] {
+            assert!(parse_append(&[
+                "--operation-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                payload[0],
+                payload[1]
+            ])
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn workspace_path_mutations_require_exact_replay_inputs() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "rename",
+            "run-42",
+            "outputs",
+            "a.bin",
+            "b.bin",
+            "--expected-generation",
+            "7",
+            "--request-id",
+            "abababababababababababababababab",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Rename {
+                workbench: "run-42".to_owned(),
+                section: "outputs".to_owned(),
+                source: "a.bin".to_owned(),
+                destination: "b.bin".to_owned(),
+                expected_generation: 7,
+                request_id: [0xab; 16],
+            })
+        );
+
+        let removed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "remove",
+            "run-42",
+            "logs",
+            "run.log",
+            "--request-id",
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "--expected-generation",
+            "3",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            removed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Remove {
+                expected_generation: 3,
+                request_id,
+                ..
+            }) if request_id == [0xcd; 16]
+        ));
+    }
+
+    #[test]
+    fn workspace_path_rejects_missing_or_malformed_request_identity() {
+        let prefix = [
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "remove",
+            "run-42",
+            "outputs",
+            "a.bin",
+            "--expected-generation",
+            "7",
+        ];
+        assert_eq!(
+            parse(args(&prefix)),
+            Err(CliError::MissingOption("--request-id"))
+        );
+
+        let mut malformed = prefix.to_vec();
+        malformed.extend(["--request-id", "ABC"]);
+        assert_eq!(
+            parse(args(&malformed)),
+            Err(CliError::InvalidRequestId("ABC".to_owned()))
+        );
+    }
+
+    #[test]
+    fn absent_command_is_help() {
+        assert_eq!(parse(Vec::new()).unwrap().command, Command::Help);
+    }
+
+    #[test]
+    fn parses_human_and_machine_readable_version_commands() {
+        assert_eq!(
+            parse(args(&["--version"])).unwrap().command,
+            Command::Version { json: false }
+        );
+        assert_eq!(
+            parse(args(&["version"])).unwrap().command,
+            Command::Version { json: false }
+        );
+        assert_eq!(
+            parse(args(&["version", "--json"])).unwrap().command,
+            Command::Version { json: true }
+        );
+    }
+
+    #[test]
+    fn parses_control_plane_routing_without_static_fences() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "01",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "--etcd-endpoint",
+            "http://127.0.0.1:22379",
+            "--etcd-key-prefix",
+            "/nokv/production",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = parsed.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(
+            route.endpoints,
+            ["http://127.0.0.1:2379", "http://127.0.0.1:22379"]
+        );
+        assert_eq!(route.key_prefix, "/nokv/production");
+        assert_eq!(route.lease_ttl_seconds, 10);
+        assert_eq!(parsed.command, Command::WorkbenchSession);
+    }
+
+    #[test]
+    fn parses_explicit_root_provisioning() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::Provision {
+                logical_shard_id: "22222222222222222222222222222222".to_owned(),
+                workbench_root: "/agents/test/wb".to_owned(),
+                adopt_legacy_object_namespace: false,
+                adopt_legacy_agent_binding: false,
+            }
+        );
+        assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
+    }
+
+    #[test]
+    fn rpc_tls_options_take_the_role_of_their_command() {
+        let tls = [
+            "--rpc-tls-ca",
+            "ca.pem",
+            "--rpc-tls-cert",
+            "agent.pem",
+            "--rpc-tls-key",
+            "agent.key",
+            "--rpc-tls-server-name",
+            "owner.test",
+        ];
+        let route = ["--agent-id", "44444444444444444444444444444444"];
+        let mut line = route.to_vec();
+        line.extend_from_slice(&tls);
+        line.extend_from_slice(&["operation", "status", "11111111111111111111111111111111"]);
+        let parsed = parse(args(&line)).unwrap();
+        assert_eq!(
+            parsed.client.tls,
+            Some(ClientTlsConfig {
+                server_roots: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("agent.pem"),
+                key: PathBuf::from("agent.key"),
+                server_name: "owner.test".to_owned(),
+            })
+        );
+        assert_eq!(parsed.server.tls, None);
+
+        let parsed = parse(args(&[
+            "--rpc-tls-cert",
+            "owner.pem",
+            "--rpc-tls-key",
+            "owner.key",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.server.tls,
+            Some(ServerTlsConfig {
+                certificate: PathBuf::from("owner.pem"),
+                key: PathBuf::from("owner.key"),
+            })
+        );
+        assert_eq!(parsed.client.tls, None);
+    }
+
+    #[test]
+    fn a_tls_client_needs_no_agent_id() {
+        let tls = [
+            "--rpc-tls-ca",
+            "ca.pem",
+            "--rpc-tls-cert",
+            "agent.pem",
+            "--rpc-tls-key",
+            "agent.key",
+            "--rpc-tls-server-name",
+            "owner.test",
+        ];
+        let status = ["operation", "status", "11111111111111111111111111111111"];
+        let mut line = tls.to_vec();
+        line.extend_from_slice(&status);
+        let parsed = parse(args(&line)).unwrap();
+        assert!(parsed.client.tls.is_some());
+        assert_eq!(parsed.agent_id, None);
+        assert_eq!(
+            parse(args(&status)),
+            Err(CliError::MissingOption("--agent-id"))
+        );
+    }
+
+    #[test]
+    fn an_audit_log_belongs_to_a_tls_owner() {
+        let owner = [
+            "--rpc-tls-cert",
+            "owner.pem",
+            "--rpc-tls-key",
+            "owner.key",
+            "--audit-log",
+            "audit.jsonl",
+            "serve",
+        ];
+        assert_eq!(
+            parse(args(&owner)).unwrap().server.audit_log,
+            Some(PathBuf::from("audit.jsonl"))
+        );
+        assert_eq!(
+            parse(args(&owner[2..])).map(|parsed| parsed.server.audit_log),
+            Err(CliError::MissingOption("--rpc-tls-cert"))
+        );
+        for line in [
+            &["--audit-log", "audit.jsonl", "serve"][..],
+            &[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--audit-log",
+                "audit.jsonl",
+                "operation",
+                "status",
+                "11111111111111111111111111111111",
+            ][..],
+        ] {
+            assert!(matches!(
+                parse(args(line)),
+                Err(CliError::UnexpectedArgument(message)) if message.starts_with("--audit-log")
+            ));
+        }
+    }
+
+    #[test]
+    fn rpc_tls_options_must_be_complete_for_their_role() {
+        let route = ["--agent-id", "44444444444444444444444444444444"];
+        let status = ["operation", "status", "11111111111111111111111111111111"];
+        let client = |tls: &[&str]| {
+            let mut line = route.to_vec();
+            line.extend_from_slice(tls);
+            line.extend_from_slice(&status);
+            parse(args(&line)).map(|parsed| parsed.client.tls)
+        };
+        assert_eq!(
+            client(&["--rpc-tls-cert", "agent.pem", "--rpc-tls-key", "agent.key"]),
+            Err(CliError::MissingOption("--rpc-tls-ca"))
+        );
+        assert_eq!(
+            client(&[
+                "--rpc-tls-ca",
+                "ca.pem",
+                "--rpc-tls-cert",
+                "agent.pem",
+                "--rpc-tls-key",
+                "agent.key",
+            ]),
+            Err(CliError::MissingOption("--rpc-tls-server-name"))
+        );
+        assert_eq!(
+            parse(args(&["--rpc-tls-cert", "owner.pem", "serve"])).map(|parsed| parsed.server.tls),
+            Err(CliError::MissingOption("--rpc-tls-key"))
+        );
+        assert!(matches!(
+            parse(args(&[
+                "--rpc-tls-cert",
+                "owner.pem",
+                "--rpc-tls-key",
+                "owner.key",
+                "--rpc-tls-ca",
+                "ca.pem",
+                "serve",
+            ])),
+            Err(CliError::UnexpectedArgument(message)) if message.starts_with("--rpc-tls-ca")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "--control-dir",
+                "/tmp/nokv-control",
+                "--rpc-tls-cert",
+                "owner.pem",
+                "identity",
+                "show",
+                &"05".repeat(16),
+            ])),
+            Err(CliError::UnexpectedArgument(message)) if message.contains("--rpc-tls-*")
+        ));
+    }
+
+    #[test]
+    fn parses_identity_commands_without_root_or_agent_options() {
+        let tenant = "05".repeat(16);
+        let principal = "06".repeat(16);
+        let root = "01".repeat(16);
+        let fingerprint = "07".repeat(32);
+        let identity = |words: &[&str]| {
+            let mut line = vec!["--control-dir", "/tmp/nokv-control", "identity"];
+            line.extend_from_slice(words);
+            parse(args(&line)).map(|parsed| parsed.command)
+        };
+        let tenant_id = TenantId::from_bytes([5; 16]);
+        let principal_id = PrincipalId::from_bytes([6; 16]);
+        assert_eq!(
+            identity(&["tenant", "create", &tenant]),
+            Ok(Command::Identity(IdentityCommand::CreateTenant {
+                tenant_id
+            }))
+        );
+        assert_eq!(
+            identity(&["principal", "create", &tenant, &principal]),
+            Ok(Command::Identity(IdentityCommand::CreatePrincipal {
+                tenant_id,
+                principal_id,
+            }))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--expires-at-unix",
+                "1800000000",
+                "--certificate",
+                "agent.pem",
+            ]),
+            Ok(Command::Identity(IdentityCommand::AddCredential {
+                tenant_id,
+                principal_id,
+                credential: CredentialSource::Certificate(PathBuf::from("agent.pem")),
+                expires_at_unix_seconds: 1_800_000_000,
+            }))
+        );
+        assert_eq!(
+            identity(&["credential", "revoke", &tenant, &fingerprint]),
+            Ok(Command::Identity(IdentityCommand::RevokeCredential {
+                tenant_id,
+                fingerprint: CredentialFingerprint::from_bytes([7; 32]),
+            }))
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "writer", "--root", &root,]),
+            Ok(Command::Identity(IdentityCommand::GrantRole(RoleBinding {
+                tenant_id,
+                principal_id,
+                role: Role::Writer,
+                scope: RoleScope::Root(RootId::from_bytes([1; 16])),
+            })))
+        );
+        assert_eq!(
+            identity(&[
+                "role",
+                "revoke",
+                &tenant,
+                &principal,
+                "--tenant-wide",
+                "--role",
+                "operator",
+            ]),
+            Ok(Command::Identity(IdentityCommand::RevokeRole(
+                RoleBinding {
+                    tenant_id,
+                    principal_id,
+                    role: Role::Operator,
+                    scope: RoleScope::Tenant,
+                }
+            )))
+        );
+        assert_eq!(
+            identity(&["root", "bind", &root, &tenant]),
+            Ok(Command::Identity(IdentityCommand::BindRoot {
+                root_id: RootId::from_bytes([1; 16]),
+                tenant_id,
+            }))
+        );
+        assert_eq!(
+            identity(&["show", &tenant]),
+            Ok(Command::Identity(IdentityCommand::Show { tenant_id }))
+        );
+    }
+
+    #[test]
+    fn identity_commands_reject_ambiguous_or_malformed_records() {
+        let tenant = "05".repeat(16);
+        let principal = "06".repeat(16);
+        let identity = |words: &[&str]| {
+            let mut line = vec!["--control-dir", "/tmp/nokv-control", "identity"];
+            line.extend_from_slice(words);
+            parse(args(&line)).map(|parsed| parsed.command)
+        };
+        assert_eq!(
+            identity(&["show", &"05".repeat(15)]),
+            Err(CliError::InvalidOption {
+                option: "tenant id",
+                value: "05".repeat(15),
+            })
+        );
+        assert_eq!(
+            identity(&["show", &"AB".repeat(16)]),
+            Err(CliError::InvalidOption {
+                option: "tenant id",
+                value: "AB".repeat(16),
+            })
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "admin"]),
+            Err(CliError::InvalidOption {
+                option: "--role",
+                value: "admin".to_owned(),
+            })
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--role", "reader"]),
+            Err(CliError::MissingOption("--tenant-wide or --root"))
+        );
+        assert_eq!(
+            identity(&[
+                "role",
+                "grant",
+                &tenant,
+                &principal,
+                "--role",
+                "reader",
+                "--tenant-wide",
+                "--root",
+                &"01".repeat(16),
+            ]),
+            Err(CliError::UnexpectedArgument("--root".to_owned()))
+        );
+        assert_eq!(
+            identity(&["role", "grant", &tenant, &principal, "--root"]),
+            Err(CliError::MissingValue("--root".to_owned()))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--fingerprint",
+                &"07".repeat(32),
+                "--certificate",
+                "agent.pem",
+                "--expires-at-unix",
+                "1800000000",
+            ]),
+            Err(CliError::UnexpectedArgument("--certificate".to_owned()))
+        );
+        assert_eq!(
+            identity(&[
+                "credential",
+                "add",
+                &tenant,
+                &principal,
+                "--fingerprint",
+                &"07".repeat(32),
+            ]),
+            Err(CliError::MissingOption("--expires-at-unix"))
+        );
+        assert_eq!(
+            identity(&["tenant", "delete", &tenant]),
+            Err(CliError::UnknownCommand(
+                "identity tenant delete".to_owned()
+            ))
+        );
+        assert_eq!(
+            identity(&["show", &tenant, "extra"]),
+            Err(CliError::UnexpectedArgument("extra".to_owned()))
+        );
+    }
+
+    #[test]
+    fn legacy_namespace_adoption_requires_an_explicit_provision_flag() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
+            "--adopt-legacy-object-namespace",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Provision {
+                adopt_legacy_object_namespace: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_namespace_adoption_rejects_unparsed_trailing_arguments() {
+        let error = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
+            "--adopt-legacy-object-namespace",
+            "unexpected",
+        ]))
+        .unwrap_err();
+
+        assert_eq!(error, CliError::UnexpectedArgument("unexpected".to_owned()));
+    }
+
+    #[test]
+    fn etcd_tls_options_are_complete_and_select_etcd_routing() {
+        let parsed = parse(args(&[
+            "--etcd-endpoint",
+            "https://127.0.0.1:2379",
+            "--etcd-tls-ca",
+            "ca.pem",
+            "--etcd-tls-cert",
+            "client.pem",
+            "--etcd-tls-key",
+            "client.key",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = parsed.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(
+            route.tls,
+            Some(EtcdTlsFiles {
+                trusted_ca: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("client.pem"),
+                key: PathBuf::from("client.key"),
+            })
+        );
+
+        let plaintext = parse(args(&[
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "workbench-session",
+        ]))
+        .unwrap();
+        let RoutingConfig::Etcd(route) = plaintext.client.routing else {
+            panic!("etcd route expected");
+        };
+        assert_eq!(route.tls, None);
+
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "--etcd-tls-cert",
+                "client.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MissingOption("--etcd-tls-key"))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--control-dir",
+                "/tmp/nokv-control",
+                "--etcd-tls-ca",
+                "ca.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::MixedRoutingOptions)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--etcd-endpoint",
+                "https://127.0.0.1:2379",
+                "--etcd-tls-ca",
+                "a.pem",
+                "--etcd-tls-ca",
+                "b.pem",
+                "workbench-session",
+            ])),
+            Err(CliError::UnexpectedArgument("--etcd-tls-ca".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mixed_static_and_control_routing_fails_closed() {
+        assert_eq!(
+            parse(args(&[
+                "--metadata-address",
+                "127.0.0.1:7750",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "workbench-session",
+            ])),
+            Err(CliError::MixedRoutingOptions)
+        );
+    }
+
+    #[test]
+    fn local_control_routing_names_one_directory_and_mixes_with_nothing() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--control-dir",
+            "/var/lib/nokv/control",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.client.routing,
+            RoutingConfig::Local(LocalRoutingConfig {
+                directory: PathBuf::from("/var/lib/nokv/control"),
+            })
+        );
+        for other in [
+            ["--etcd-endpoint", "http://127.0.0.1:2379"],
+            ["--metadata-address", "127.0.0.1:7750"],
+        ] {
+            assert_eq!(
+                parse(args(&[
+                    "--control-dir",
+                    "/var/lib/nokv/control",
+                    other[0],
+                    other[1],
+                    "serve",
+                ])),
+                Err(CliError::MixedRoutingOptions)
+            );
+        }
+    }
+
+    #[test]
+    fn server_recovery_publication_defaults_to_local_only_and_shared_is_explicit() {
+        // A fresh or reopened owner runs on its exclusive Holt WAL alone unless
+        // shared publication is asked for. Publishing to Control is a switch,
+        // not the resting state.
+        for open in ["--metadata-create", "--metadata-reopen"] {
+            let parsed = parse(args(&[open, "/var/lib/nokv/shard.holt", "serve"])).unwrap();
+            assert_eq!(
+                parsed.server.recovery_publication,
+                RecoveryPublicationConfig::LocalOnly,
+                "{open} without --recovery-publication must be local-only"
+            );
+        }
+
+        let shared = parse(args(&[
+            "--metadata-reopen",
+            "/var/lib/nokv/shard.holt",
+            "--recovery-publication",
+            "shared",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            shared.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
+        );
+
+        let local_only = parse(args(&[
+            "--metadata-reopen",
+            "/var/lib/nokv/shard.holt",
+            "--recovery-publication",
+            "local-only",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            local_only.server.recovery_publication,
+            RecoveryPublicationConfig::LocalOnly
+        );
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-reopen",
+                "/var/lib/nokv/shard.holt",
+                "--recovery-publication",
+                "sometimes",
+                "serve",
+            ])),
+            Err(CliError::InvalidOption {
+                option: "--recovery-publication",
+                value: "sometimes".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn recover_log_implies_shared_publication_unless_contradicted() {
+        // Recovering from the shared log installs a shared frontier, so the
+        // only coherent publication mode is shared. Leaving the option out
+        // must select it rather than trip over the local-only default.
+        let recovered = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered.holt",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            recovered.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
+        );
+
+        // Saying so explicitly is fine.
+        let explicit = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered.holt",
+            "--recovery-publication",
+            "shared",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            explicit.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
+        );
+
+        // A shared-log successor cannot be a local-only owner.
+        assert_eq!(
+            parse(args(&[
+                "--metadata-recover-log",
+                "/var/lib/nokv/recovered.holt",
+                "--recovery-publication",
+                "local-only",
+                "serve",
+            ])),
+            Err(CliError::LocalOnlyRecoverLog)
+        );
+    }
+
+    #[test]
+    fn an_advertised_endpoint_must_be_a_socket_address() {
+        for endpoint in ["nokv-owner:7750", "metadata-a.internal:7750", "10.0.0.5"] {
+            assert_eq!(
+                parse(args(&["--advertise-endpoint", endpoint, "serve"])),
+                Err(CliError::InvalidAddress {
+                    option: "--advertise-endpoint",
+                    value: endpoint.to_owned(),
+                }),
+                "{endpoint}"
+            );
+        }
+        for endpoint in ["10.0.0.5:7750", "[fd00::5]:7750"] {
+            let parsed = parse(args(&["--advertise-endpoint", endpoint, "serve"])).unwrap();
+            assert_eq!(parsed.server.advertise_endpoint.as_deref(), Some(endpoint));
+        }
+    }
+
+    #[test]
+    fn server_metadata_open_mode_is_explicit_and_unique() {
+        let parsed = parse(args(&[
+            "--metadata-reopen",
+            "/var/lib/nokv/shard.holt",
+            "--node-id",
+            "owner-a",
+            "--advertise-endpoint",
+            "10.0.0.5:7750",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.server.metadata_store,
+            Some(MetadataStoreConfig::Reopen(PathBuf::from(
+                "/var/lib/nokv/shard.holt"
+            )))
+        );
+        assert_eq!(parsed.server.node_id.as_deref(), Some("owner-a"));
+        assert_eq!(
+            parsed.server.advertise_endpoint.as_deref(),
+            Some("10.0.0.5:7750")
+        );
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-create",
+                "/tmp/new.holt",
+                "--metadata-reopen",
+                "/tmp/existing.holt",
+                "serve",
+            ])),
+            Err(CliError::MixedMetadataStoreOptions)
+        );
+
+        let recovered = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered-shard.holt",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            recovered.server.metadata_store,
+            Some(MetadataStoreConfig::RecoverLog(PathBuf::from(
+                "/var/lib/nokv/recovered-shard.holt"
+            )))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--metadata-reopen",
+                "/tmp/existing.holt",
+                "--metadata-recover-log",
+                "/tmp/recovered.holt",
+                "serve",
+            ])),
+            Err(CliError::MixedMetadataStoreOptions)
+        );
+    }
+
+    #[test]
+    fn parses_server_handshake_resource_limits() {
+        let parsed = parse(args(&[
+            "--handshake-timeout-millis",
+            "750",
+            "--max-inflight-connections",
+            "64",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.server.handshake_timeout_millis, 750);
+        assert_eq!(parsed.server.max_inflight_connections, 64);
+    }
+
+    #[test]
+    fn unknown_options_fail_closed() {
+        assert!(matches!(
+            parse(args(&["--mount", "3", "workbench-session"])),
+            Err(CliError::UnknownOption(option)) if option == "--mount"
+        ));
+    }
+
+    #[test]
+    fn provision_binds_the_workbench_root_and_agent_commands_take_none() {
+        assert_eq!(
+            parse(args(&[
+                "--root-id",
+                "11",
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "provision",
+                "22222222222222222222222222222222",
+            ])),
+            Err(CliError::MissingOption("--workbench-root"))
+        );
+        // The root's presentation comes from the control plane, not from
+        // each Agent's command line.
+        for arguments in [
+            args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--workbench-root",
+                "/agents/test/wb",
+                "workbench-session",
+            ]),
+            args(&[
+                "--workbench-root",
+                "/agents/test/wb",
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "workbench",
+                "workbench_create",
+                r#"{"id":"run-1"}"#,
+            ]),
+        ] {
+            assert!(
+                matches!(parse(arguments), Err(CliError::UnknownOption(option)) if option == "--workbench-root")
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_is_not_a_command() {
+        for arguments in [
+            args(&["mcp"]),
+            args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "mcp",
+                "--profile",
+                "agent",
+            ]),
+        ] {
+            assert_eq!(
+                parse(arguments),
+                Err(CliError::UnknownCommand("mcp".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+        for arguments in [
+            args(&["workbench-session"]),
+            args(&["workbench", "workbench_create", r#"{"id":"run-1"}"#]),
+            args(&[
+                "materialize",
+                "run-1",
+                "outputs",
+                "result.bin",
+                "/tmp/result.bin",
+            ]),
+            args(&[
+                "collect",
+                "run-1",
+                "outputs",
+                "/tmp/result.bin",
+                "result.bin",
+            ]),
+            args(&[
+                "--root-id",
+                "11111111111111111111111111111111",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "workspace-path",
+                "remove",
+                "run-1",
+                "outputs",
+                "result.bin",
+                "--expected-generation",
+                "1",
+                "--request-id",
+                "abababababababababababababababab",
+            ]),
+            args(&[
+                "--root-id",
+                "11111111111111111111111111111111",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "provision",
+                "22222222222222222222222222222222",
+                "--workbench-root",
+                "/agents/test/wb",
+            ]),
+        ] {
+            assert_eq!(parse(arguments), Err(CliError::MissingOption("--agent-id")));
+        }
+    }
+
+    #[test]
+    fn schema_version_help_and_serve_do_not_require_an_agent_id() {
+        assert_eq!(parse(args(&["schema"])).unwrap().command, Command::Schema);
+        assert!(matches!(
+            parse(args(&["version"])).unwrap().command,
+            Command::Version { .. }
+        ));
+        assert_eq!(parse(args(&["help"])).unwrap().command, Command::Help);
+        assert_eq!(parse(args(&["serve"])).unwrap().command, Command::Serve);
+    }
+
+    #[test]
+    fn legacy_agent_binding_adoption_is_explicit_and_provision_only() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--workbench-root",
+            "/agents/test/wb",
+            "--adopt-legacy-agent-binding",
+            "--adopt-legacy-object-namespace",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Provision {
+                adopt_legacy_agent_binding: true,
+                adopt_legacy_object_namespace: true,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            parse(args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "workbench-session",
+                "--adopt-legacy-agent-binding",
+            ])),
+            Err(CliError::UnexpectedArgument(argument))
+                if argument == "--adopt-legacy-agent-binding"
+        ));
+    }
+
+    const SESSION_ROUTE: [&str; 6] = [
+        "--root-id",
+        "01",
+        "--agent-id",
+        "44444444444444444444444444444444",
+        "--control-dir",
+        "/control",
+    ];
+
+    #[test]
+    fn parses_client_retry_backoff_options() {
+        let parsed = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--max-attempts",
+                    "16",
+                    "--retry-backoff-ms",
+                    "250",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.client.max_attempts, 16);
+        assert_eq!(parsed.client.retry_backoff_ms, 250);
+        assert_eq!(parsed.client.max_retry_backoff_ms, 2_000);
+        assert_eq!(parsed.command, Command::WorkbenchSession);
+
+        let defaults = parse(args(&[&SESSION_ROUTE[..], &["workbench-session"]].concat())).unwrap();
+        assert_eq!(defaults.client.max_attempts, 3);
+        assert_eq!(defaults.client.retry_backoff_ms, 0);
+        assert_eq!(defaults.client.max_retry_backoff_ms, 2_000);
+    }
+
+    #[test]
+    fn rejects_a_retry_backoff_above_its_bound() {
+        let Err(error) = parse(args(
+            &[
+                &SESSION_ROUTE[..],
+                &[
+                    "--retry-backoff-ms",
+                    "3000",
+                    "--max-retry-backoff-ms",
+                    "2000",
+                    "workbench-session",
+                ],
+            ]
+            .concat(),
+        )) else {
+            panic!("a backoff above its bound must be rejected");
+        };
+        assert_eq!(
+            error,
+            CliError::InvalidOption {
+                option: "--retry-backoff-ms",
+                value: "3000".to_owned(),
+            }
+        );
+    }
+}

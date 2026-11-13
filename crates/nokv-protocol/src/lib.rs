@@ -1,0 +1,91 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Storage-neutral RPC contract for Agent workspaces.
+//!
+//! Every request is routed by an explicit [`RootRoute`]. Paths are validated by
+//! `nokv-types`, and the wire surface exposes neither Holt layout nor
+//! object-provider configuration.
+
+mod append;
+mod artifact_publish;
+mod codec;
+mod error;
+mod handshake;
+mod request;
+mod response;
+mod types;
+
+/// Maximum distinct physical owner revisions retained by one artifact.
+pub const MAX_ARTIFACT_DEPENDENCY_OWNERS: u32 = 64;
+/// Maximum sealed artifact revision dependency depth.
+pub const MAX_ARTIFACT_DEPENDENCY_DEPTH: u8 = 8;
+
+pub use append::{
+    stable_append_attempt_identities, AppendAttemptBinding, AppendAttemptPhase,
+    AppendCleanupInspection, AppendCleanupRetryResult, AppendPreparation, AppendResult,
+    InspectAppendCleanupRequest, RetryAppendCleanupRequest,
+};
+pub use artifact_publish::{
+    inline_artifact_body_digest, parse_sha256_digest_uri, seal_artifact_publish_plan,
+    sha256_digest_uri, ArtifactPublishPlanSeal, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_PUBLISH_OBJECTS, MAX_ARTIFACT_READ_PLAN_ROWS, MAX_ARTIFACT_UPLOAD_BODY_BYTES,
+};
+pub use codec::{
+    decode_request, decode_response, encode_request, encode_response, MAX_FRAME_BYTES,
+    WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
+};
+pub use error::{ConflictKind, ErrorCode, ProtocolError, RpcFailure};
+pub use handshake::{
+    decode_handshake_frame, decode_handshake_payload, encode_handshake_frame,
+    encode_handshake_payload, has_handshake_magic, HandshakeError, HandshakeKind,
+    WorkspaceHandshake, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, HANDSHAKE_SCHEMA_BYTES,
+    WORKSPACE_HANDSHAKE_MAGIC,
+};
+pub use nokv_types::MAX_INLINE_ARTIFACT_BODY_BYTES;
+pub use request::{
+    AbortArtifactPublishRequest, AbortGenericIndexRegistrationRequest, AggregateFunction,
+    AggregateRequest, AggregateSpec, AppendGenericIndexRowsRequest, BeginArtifactPublishRequest,
+    BeginGenericIndexRegistrationRequest, BindRestoreDestinationRequest, CatalogPathMatch,
+    CatalogRequest, ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest,
+    CreateWorkspaceRequest, FinalizeGenericIndexRegistrationRequest, FinalizeRestoreRequest,
+    FindWorkspacesRequest, FinishArtifactPublishRequest, GenericIndexFieldCapability,
+    GenericIndexFieldValues, GenericIndexRow, GetGenericIndexRegistrationRequest,
+    GetOperationRequest, GetPathRequest, GetSnapshotRequest, GetWorkspaceRequest, ListPathsRequest,
+    ListSnapshotsRequest, MintSnapshotRequest, PrepareArtifactPublishRequest,
+    PrepareRestoreRequest, PublishInlineArtifactRequest, QuarantineResolution, QueryOperand,
+    QueryOperator, QueryPredicate, QueryProfile, QueryScope, ReadRestoreSourceRunManifestRequest,
+    ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest, RenamePathRequest,
+    RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity, RestoreSource,
+    RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
+    StageArtifactObjectsRequest, UploadArtifactObjectRequest, WorkspaceContinuationFence,
+    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_CHANGE_PAGE_LIMIT,
+    MAX_GENERIC_INDEX_ABORT_ROWS, MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS,
+    MAX_GENERIC_INDEX_ROW_BYTES, MAX_GENERIC_INDEX_ROW_FIELDS, MAX_GENERIC_INDEX_VALUES_PER_FIELD,
+    MAX_QUERY_PAGE_LIMIT,
+};
+pub use response::{
+    AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,
+    ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, FacetBucket, FacetResult,
+    FindWorkspacesResult, GenericIndexAbortResult, GenericIndexAppendReceipt,
+    GenericIndexAppendResult, GenericIndexRegistrationPhase, GenericIndexRegistrationStatus,
+    GenericNamespaceArtifact, GenericNamespaceHit, GenericNamespaceKind, OperationProgress,
+    OperationResult, OperationState, OperationStatus, PathListEntry, PathPage, PathReadResult,
+    PublishPreparation, PublishResult, RemovePathResult, RenamePathResult,
+    RestoreDestinationBinding, RestoreDestinationManifestBindings, RestoreManifestBinding,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSourceCommitBinding,
+    SearchHit, SearchResult, SearchRow, SnapshotPage, SnapshotResult, SnapshotStatus,
+    WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    WorkspaceSummary, WorkspaceSummaryWithCommit,
+};
+pub use types::{
+    AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
+    CommitIdentity, ContentType, Digest, DigestUri, FieldValue, GenericIndexGenerationIdentity,
+    LogicalShardIdentity, ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity,
+    OperationKind, OperationToken, PageRequest, PathMetadata, PrincipalIdentity,
+    PublicationAuthority, PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute,
+    ScalarValue, SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName,
+    WorkspaceCapability, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+};

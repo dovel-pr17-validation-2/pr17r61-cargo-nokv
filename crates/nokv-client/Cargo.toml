@@ -1,0 +1,27 @@
+[package]
+name = "nokv-client"
+version = "0.1.0"
+description = "Root-routed Rust SDK for NoKV Agent workspaces."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+control = ["dep:nokv-control"]
+etcd = ["control", "nokv-control/etcd"]
+
+[dependencies]
+nokv-control = { workspace = true, optional = true }
+nokv-object.workspace = true
+nokv-protocol.workspace = true
+nokv-types.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true

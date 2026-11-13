@@ -1,0 +1,272 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Python SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Canonical stable tag, for example v0.11.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate immutable release identity
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: scripts/release
+
+      - name: Validate tag before resolving a ref
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release/python_sdk_release.py validate-tag "$RELEASE_TAG")"
+          git fetch --no-tags https://github.com/NoKV-Lab/NoKV.git \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid release commit::Resolved commit is not canonical."
+            exit 1
+          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=$version"
+            echo "commit=$commit"
+          } >>"$GITHUB_OUTPUT"
+
+  wheels:
+    name: Build and smoke wheel (${{ matrix.name }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            manylinux: "2_28"
+          - name: macos-arm64
+            runner: macos-15
+            manylinux: ""
+          - name: macos-x86_64
+            runner: macos-15-intel
+            manylinux: ""
+    runs-on: ${{ matrix.runner }}
+    env:
+      EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+
+      - name: Validate the SDK version against the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          declared="$(python3 scripts/release/python_sdk_release.py validate-version \
+            --repository . --tag "$RELEASE_TAG")"
+          if [[ "$declared" != "$RELEASE_VERSION" ]]; then
+            echo "::error title=Version drift::SDK declares $declared, tag is $RELEASE_VERSION."
+            exit 1
+          fi
+          python3 scripts/release/test_python_sdk_release.py
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install protobuf
+          protoc --version
+
+      # Linux wheels are built inside the official manylinux_2_28 image so the
+      # native module only links glibc >= 2.28 symbols. The etcd client crate
+      # compiles its protobuf definitions at build time, so the image needs a
+      # protoc; the build installs a pinned official release (see below).
+      - name: Build manylinux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          working-directory: crates/nokv-python
+          args: --release --out ../../dist
+          manylinux: ${{ matrix.manylinux }}
+          before-script-linux: |
+            set -euo pipefail
+            # etcd-client compiles proto3 files that use `optional` fields and
+            # import the well-known types. AlmaLinux 8's protoc 3.5 cannot build
+            # them, so install the official protoc release, pinned by checksum.
+            protoc_version=36.2
+            case "$(uname -m)" in
+              x86_64) protoc_arch=x86_64; protoc_sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+              aarch64) protoc_arch=aarch_64; protoc_sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+              *) echo "no pinned protoc for $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl --proto '=https' --tlsv1.2 --retry 5 --location --silent --show-error --fail \
+              --output /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-${protoc_arch}.zip"
+            echo "${protoc_sha256}  /tmp/protoc.zip" | sha256sum -c -
+            python="$(ls /opt/python/cp3*/bin/python3 | sort -V | tail -n 1)"
+            "$python" -m zipfile -e /tmp/protoc.zip /usr/local
+            chmod 0755 /usr/local/bin/protoc
+            protoc --version
+
+      - name: Build macOS wheel
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: build
+          working-directory: crates/nokv-python
+          args: --release --out ../../dist
+
+      - name: Install the built wheel into a clean environment and test it
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          venv="$RUNNER_TEMP/nokv-sdk-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/python" -m pip install --quiet --upgrade pip
+          "$venv/bin/python" -m pip install --quiet pytest fsspec 'msgpack>=1.1,<2'
+          "$venv/bin/python" -m pip install --quiet --no-index --find-links dist "nokv==$RELEASE_VERSION"
+          python3 scripts/release/python_sdk_release.py verify-install \
+            --python "$venv/bin/python" --version "$RELEASE_VERSION"
+          cd "$RUNNER_TEMP"
+          "$venv/bin/python" -m pytest -q "$GITHUB_WORKSPACE/crates/nokv-python/tests"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nokv-python-sdk-${{ needs.validate.outputs.commit }}-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish wheels after every platform gate
+    needs:
+      - validate
+      - wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download every tested wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: nokv-python-sdk-${{ needs.validate.outputs.commit }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+
+      - name: Write manifest and checksums for the exact wheel set
+        shell: bash
+        env:
+          DIST_DIR: ${{ runner.temp }}/dist
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          python3 scripts/release/python_sdk_release.py write-assets \
+            --dist "$DIST_DIR" \
+            --version "$RELEASE_VERSION" \
+            --tag "$RELEASE_TAG" \
+            --commit "$EXPECTED_COMMIT" \
+            --output "$RELEASE_DIR"
+          python3 scripts/release/python_sdk_release.py verify-wheels \
+            --manifest "$RELEASE_DIR/nokv-$RELEASE_VERSION-python-sdk.json" \
+            --dist "$DIST_DIR"
+          cp "$DIST_DIR"/*.whl "$RELEASE_DIR/"
+          ls -l "$RELEASE_DIR"
+
+      - name: Revalidate tag binding before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force https://github.com/NoKV-Lab/NoKV.git \
+            "refs/tags/$RELEASE_TAG:refs/nokv-release/$RELEASE_TAG"
+          actual="$(git rev-parse "refs/nokv-release/$RELEASE_TAG^{commit}")"
+          if [[ "$actual" != "$EXPECTED_COMMIT" ]]; then
+            echo "::error title=Release tag moved::Expected $EXPECTED_COMMIT, found $actual."
+            exit 1
+          fi
+
+      # Assets are immutable once published: an existing asset with the same
+      # name must be byte-identical to the freshly built one, otherwise the
+      # release stops here and a human decides.
+      - name: Publish immutable wheel assets
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          cd "$RELEASE_DIR"
+          assets=( nokv-"$RELEASE_VERSION"-cp39-abi3-*.whl \
+                   nokv-"$RELEASE_VERSION"-python-sdk.json \
+                   nokv-"$RELEASE_VERSION"-python-sdk-SHA256SUMS )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            existing="$RUNNER_TEMP/existing-python-sdk-release"
+            mkdir -p "$existing"
+            published="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+            to_upload=()
+            for asset in "${assets[@]}"; do
+              if grep -qxF "$asset" <<<"$published"; then
+                gh release download "$RELEASE_TAG" --dir "$existing" --pattern "$asset"
+                if ! cmp "$asset" "$existing/$asset"; then
+                  echo "::error title=Immutable asset conflict::release asset already exists with different bytes: $asset"
+                  exit 1
+                fi
+              else
+                to_upload+=("$asset")
+              fi
+            done
+            if (( ${#to_upload[@]} > 0 )); then
+              gh release upload "$RELEASE_TAG" "${to_upload[@]}"
+            fi
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --latest \
+              --title "NoKV $RELEASE_VERSION" \
+              --notes "Python SDK wheels for commit $EXPECTED_COMMIT."
+          fi

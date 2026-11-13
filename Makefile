@@ -1,0 +1,67 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+NOKV_MANIFEST := Cargo.toml
+
+.PHONY: help build test fmt lint governance-test workbench-test verify clean
+
+help:
+	@echo "NoKV development commands:"
+	@echo ""
+	@echo "  make build       - Build the Rust workspace"
+	@echo "  make test        - Run the Rust workspace tests"
+	@echo "  make fmt         - Format the Rust workspace"
+	@echo "  make lint        - Run cargo clippy"
+	@echo "  make governance-test - Run pull request governance policy tests"
+	@echo "  make workbench-test - Run Workbench contract and live workflow tests"
+	@echo "  make verify      - Run Rust and Workbench validation"
+	@echo "  make clean       - Remove build artifacts"
+
+build:
+	cargo build --manifest-path $(NOKV_MANIFEST) --workspace
+
+test:
+	cargo test --manifest-path $(NOKV_MANIFEST) --workspace
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta --features metadata-read-stats
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --features read-stats
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-bench --features metadata-read-stats
+
+fmt:
+	cargo fmt --manifest-path $(NOKV_MANIFEST) --all
+
+lint:
+	cargo clippy --manifest-path $(NOKV_MANIFEST) --workspace --all-targets -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
+
+workbench-test:
+	python3 scripts/workbench/pre423_contract_ledger.py
+	python3 scripts/workbench/pre423_contract_ledger_test.py
+	python3 scripts/workbench/workbench_contract_test.py
+	python3 scripts/workbench/live_workbench_test.py
+
+governance-test:
+	python3 scripts/ci/pr_change_governance_test.py
+	python3 scripts/release/test_homebrew_source_release.py
+	python3 scripts/release/test_python_sdk_release.py
+
+verify:
+	cargo fmt --manifest-path $(NOKV_MANIFEST) --all -- --check
+	cargo clippy --manifest-path $(NOKV_MANIFEST) --workspace --all-targets -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
+	cargo test --manifest-path $(NOKV_MANIFEST) --workspace
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta --features metadata-read-stats
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --features read-stats
+	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-bench --features metadata-read-stats
+	python3 scripts/workbench/pre423_contract_ledger.py
+	python3 scripts/workbench/pre423_contract_ledger_test.py
+	python3 scripts/workbench/workbench_contract_test.py
+	python3 scripts/workbench/live_workbench_test.py
+	python3 scripts/ci/pr_change_governance_test.py
+	python3 scripts/release/test_homebrew_source_release.py
+	python3 scripts/release/test_python_sdk_release.py
+	git diff --check
+
+clean:
+	rm -rf target

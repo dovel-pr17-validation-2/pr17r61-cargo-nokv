@@ -1,0 +1,2194 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use nokv_protocol::{
+    decode_handshake_frame, decode_handshake_payload, decode_request, encode_handshake_frame,
+    encode_response, has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure,
+    WorkspaceHandshake, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceRpcResponse,
+    HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
+};
+use nokv_types::CredentialFingerprint;
+use sha2::{Digest as _, Sha256};
+
+use crate::access::{classify, AccessDenial, ConnectionPrincipal, POLICY_REFRESH_INTERVAL};
+use crate::audit::{Refusal, RefusalReason};
+use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
+use crate::rpc_tls::{
+    accept_tls, drain_tls_record, opens_tls_record, DeadlineSocket, RpcServerTls, RpcStream,
+};
+use crate::{RequestAuthority, RootOwnerRegistry, ServerError, ShardOwner};
+
+static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerOptions {
+    pub bind: SocketAddr,
+    pub handshake_timeout: Duration,
+    pub read_timeout: Duration,
+    pub write_timeout: Duration,
+    pub lease_renew_interval: Duration,
+    pub max_inflight_connections: usize,
+}
+
+impl ServerOptions {
+    fn validate(self) -> Result<(), ServerError> {
+        if self.handshake_timeout.is_zero()
+            || self.read_timeout.is_zero()
+            || self.write_timeout.is_zero()
+            || self.lease_renew_interval.is_zero()
+        {
+            return Err(ServerError::InvalidOptions(
+                "connection timeouts and lease renewal interval must be greater than zero"
+                    .to_owned(),
+            ));
+        }
+        if self.max_inflight_connections == 0 {
+            return Err(ServerError::InvalidOptions(
+                "maximum in-flight connections must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct ConnectionLimiter {
+    maximum: usize,
+    in_flight: AtomicUsize,
+}
+
+impl ConnectionLimiter {
+    fn new(maximum: usize) -> Option<Self> {
+        (maximum > 0).then(|| Self {
+            maximum,
+            in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.maximum {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let previous = self.limiter.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+/// Shared fail-closed owner-loss state for RPC and background workers.
+#[derive(Default)]
+struct OwnerLossState {
+    lost: AtomicBool,
+    control_error: Mutex<Option<nokv_control::ControlError>>,
+}
+
+/// Shared fail-closed owner-loss signal for the RPC runtime and owner-fenced
+/// background workers.
+#[derive(Clone, Default)]
+pub struct OwnerLossSignal(Arc<OwnerLossState>);
+
+impl OwnerLossSignal {
+    pub fn is_lost(&self) -> bool {
+        self.0.lost.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn control_error(&self) -> Option<nokv_control::ControlError> {
+        self.0
+            .control_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Fail the complete owner scope closed without a control-plane cause.
+    pub fn fail_closed(&self) {
+        self.mark_lost();
+    }
+
+    /// Record the typed control-plane cause before publishing owner loss.
+    pub(crate) fn fail_closed_with_control(&self, error: nokv_control::ControlError) {
+        {
+            let mut current = self
+                .0
+                .control_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            if current.is_none() {
+                *current = Some(error);
+            }
+        }
+
+        self.mark_lost();
+    }
+
+    fn mark_lost(&self) {
+        self.0.lost.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerHealth {
+    pub protocol_schema: &'static str,
+    pub installed_roots: usize,
+}
+
+pub struct WorkspaceServer {
+    options: ServerOptions,
+    registry: Arc<RootOwnerRegistry>,
+    ownership: Vec<ShardOwner>,
+    owner_loss: OwnerLossSignal,
+    tls: Option<Arc<RpcServerTls>>,
+}
+
+impl WorkspaceServer {
+    pub fn new(
+        options: ServerOptions,
+        registry: Arc<RootOwnerRegistry>,
+        ownership: Vec<ShardOwner>,
+    ) -> Result<Self, ServerError> {
+        let owner_loss = registry.owner_loss_signal();
+
+        if let Err(error) = require_owner_retained(&owner_loss) {
+            return Err(release_rejected_ownership(ownership, error));
+        }
+
+        if let Err(error) = validate_ownership(options, &registry, &ownership) {
+            return Err(release_rejected_ownership(ownership, error));
+        }
+
+        Ok(Self {
+            options,
+            registry,
+            ownership,
+            owner_loss,
+            tls: None,
+        })
+    }
+
+    /// Serve every connection over TLS and authenticate each client; a
+    /// plaintext client is refused.
+    pub fn with_rpc_tls(self, tls: RpcServerTls) -> Self {
+        Self {
+            tls: Some(Arc::new(tls)),
+            ..self
+        }
+    }
+
+    pub fn health(&self) -> Result<ServerHealth, ServerError> {
+        Ok(ServerHealth {
+            protocol_schema: WORKSPACE_PROTOCOL_SCHEMA,
+            installed_roots: self.registry.installed_root_count()?,
+        })
+    }
+
+    /// Runtime lease-renewal hook. A failed renewal uninstalls that owner's
+    /// complete root-route set before the error is returned.
+    /// Mount a root provisioned after the owner started onto the owner of
+    /// its shard; see [`ShardOwner::mount_root`].
+    pub fn mount_root(
+        &self,
+        placement: &nokv_control::RootPlacement,
+        root: crate::RootAttach,
+    ) -> Result<nokv_protocol::RootRoute, ServerError> {
+        require_owner_retained(&self.owner_loss)?;
+        let owner = self
+            .ownership
+            .iter()
+            .find(|owner| owner.shard_id() == placement.logical_shard_id)
+            .ok_or_else(|| {
+                ServerError::InvalidOptions(format!(
+                    "no owner of logical shard {:?} is served here",
+                    placement.logical_shard_id
+                ))
+            })?;
+        owner.mount_root(placement, root)
+    }
+
+    pub fn renew_ownership(&self) -> Result<(), ServerError> {
+        for owner in &self.ownership {
+            if let Err(error) = owner.renew_or_uninstall() {
+                match &error {
+                    ServerError::Control(control) => {
+                        self.owner_loss.fail_closed_with_control(control.clone());
+                    }
+                    _ => self.owner_loss.mark_lost(),
+                }
+
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove all routes and release every logical-shard lease once.
+    pub fn release_ownership(self) -> Result<(), ServerError> {
+        release_ownership(self.ownership)
+    }
+
+    pub fn owner_loss_signal(&self) -> OwnerLossSignal {
+        self.owner_loss.clone()
+    }
+
+    pub fn run(&self) -> Result<(), ServerError> {
+        self.run_until_shutdown(&NEVER_SHUTDOWN)
+    }
+
+    /// Serve until graceful shutdown is requested, then stop accepting new
+    /// connections and drain every admitted connection while retaining and
+    /// renewing ownership.
+    pub fn run_until_shutdown(&self, shutdown: &AtomicBool) -> Result<(), ServerError> {
+        let listener = TcpListener::bind(self.options.bind).map_err(ServerError::Bind)?;
+        self.serve_until_shutdown(listener, shutdown)
+    }
+
+    pub fn serve(&self, listener: TcpListener) -> Result<(), ServerError> {
+        self.serve_until_shutdown(listener, &NEVER_SHUTDOWN)
+    }
+
+    pub fn serve_until_shutdown(
+        &self,
+        listener: TcpListener,
+        shutdown: &AtomicBool,
+    ) -> Result<(), ServerError> {
+        serve_socket_loop(
+            listener,
+            self.options,
+            Arc::clone(&self.registry),
+            self.tls.clone(),
+            self.owner_loss.clone(),
+            shutdown,
+            || self.renew_ownership(),
+        )
+    }
+
+    /// Dispatch one encoded request in process. No client identity comes with
+    /// the frame, so a server that authenticates its clients refuses it.
+    pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
+        if self.tls.is_some() {
+            return Err(ServerError::InvalidOptions(
+                "direct frame dispatch carries no client identity; this server authenticates \
+                 every client over TLS"
+                    .to_owned(),
+            ));
+        }
+        let request = decode_request(encoded)?;
+        let response = self
+            .registry
+            .dispatch_guarded(request, RequestAuthority::TRUSTED)?;
+        encode_response(response.response()).map_err(ServerError::Protocol)
+    }
+}
+
+fn serve_socket_loop(
+    listener: TcpListener,
+    options: ServerOptions,
+    registry: Arc<RootOwnerRegistry>,
+    tls: Option<Arc<RpcServerTls>>,
+    owner_loss: OwnerLossSignal,
+    shutdown: &AtomicBool,
+    mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
+) -> Result<(), ServerError> {
+    options.validate()?;
+    listener
+        .set_nonblocking(true)
+        .map_err(ServerError::Connection)?;
+    // The policy copy refreshes on its own thread: a slow control plane
+    // delays no accept and no renewal, and the thread ends with the loop.
+    let refresh_stopped = AtomicBool::new(false);
+    thread::scope(|scope| {
+        if let Some(tls) = tls.as_deref() {
+            thread::Builder::new()
+                .name("nokv-policy-refresh".to_owned())
+                .spawn_scoped(scope, || refresh_policy_until(tls, &refresh_stopped))
+                .map_err(ServerError::Connection)?;
+        }
+        let served = accept_until_shutdown(
+            &listener,
+            options,
+            &registry,
+            &tls,
+            &owner_loss,
+            shutdown,
+            &mut renew_ownership,
+        );
+        refresh_stopped.store(true, Ordering::Release);
+        served
+    })
+}
+
+/// Refresh the tenant policy on its interval until `stopped`.
+fn refresh_policy_until(tls: &RpcServerTls, stopped: &AtomicBool) {
+    let mut policy = PolicyRefresh::new(tls);
+    while !stopped.load(Ordering::Acquire) {
+        policy.refresh_when_due(Instant::now());
+        thread::sleep(RUNTIME_EVENT_POLL);
+    }
+}
+
+fn accept_until_shutdown(
+    listener: &TcpListener,
+    options: ServerOptions,
+    registry: &Arc<RootOwnerRegistry>,
+    tls: &Option<Arc<RpcServerTls>>,
+    owner_loss: &OwnerLossSignal,
+    shutdown: &AtomicBool,
+    renew_ownership: &mut impl FnMut() -> Result<(), ServerError>,
+) -> Result<(), ServerError> {
+    let mut next_renewal = Instant::now();
+    let connections = Arc::new(
+        ConnectionLimiter::new(options.max_inflight_connections)
+            .expect("validated connection maximum is nonzero"),
+    );
+    loop {
+        require_owner_retained(owner_loss)?;
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let now = Instant::now();
+        if now >= next_renewal {
+            renew_ownership()?;
+            next_renewal = Instant::now() + options.lease_renew_interval;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                require_owner_retained(owner_loss)?;
+                if shutdown.load(Ordering::Acquire) {
+                    drop(stream);
+                    continue;
+                }
+                let Some(permit) = connections.try_acquire() else {
+                    drop(stream);
+                    continue;
+                };
+                stream
+                    .set_nonblocking(false)
+                    .map_err(ServerError::Connection)?;
+                let registry = Arc::clone(registry);
+                let tls = tls.clone();
+                thread::Builder::new()
+                    .name("nokv-workspace-rpc".to_owned())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let _ = serve_connection(stream, registry, options, tls.as_deref());
+                    })
+                    .map_err(ServerError::Connection)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_connection(listener, next_renewal);
+            }
+            Err(error) => return Err(ServerError::Connection(error)),
+        }
+    }
+
+    while connections.in_flight() != 0 {
+        require_owner_retained(owner_loss)?;
+        let now = Instant::now();
+        if now >= next_renewal {
+            renew_ownership()?;
+            next_renewal = Instant::now() + options.lease_renew_interval;
+        }
+        sleep_until_runtime_event(next_renewal);
+    }
+    require_owner_retained(owner_loss)
+}
+
+/// Refreshes the tenant policy of a TLS listener on its interval. A failure
+/// is reported once and again when it clears; meanwhile the last copy serves
+/// until it reaches the owner's policy age bound.
+struct PolicyRefresh<'a> {
+    tls: &'a RpcServerTls,
+    next: Instant,
+    failing: bool,
+}
+
+impl<'a> PolicyRefresh<'a> {
+    fn new(tls: &'a RpcServerTls) -> Self {
+        Self {
+            tls,
+            next: Instant::now() + POLICY_REFRESH_INTERVAL,
+            failing: false,
+        }
+    }
+
+    fn refresh_when_due(&mut self, now: Instant) {
+        if now < self.next {
+            return;
+        }
+        match self.tls.access.refresh() {
+            Ok(()) if self.failing => {
+                eprintln!("nokv-server: the tenant policy refreshes again");
+                self.failing = false;
+            }
+            Ok(()) => {}
+            Err(error) if !self.failing => {
+                eprintln!(
+                    "nokv-server: cannot refresh the tenant policy: {error}; requests are refused \
+                     once the last copy is {} s old",
+                    self.tls.access.max_age().as_secs()
+                );
+                self.failing = true;
+            }
+            Err(_) => {}
+        }
+        self.next = Instant::now() + POLICY_REFRESH_INTERVAL;
+    }
+}
+
+fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerError> {
+    if let Some(error) = owner_loss.control_error() {
+        return Err(ServerError::Control(error));
+    }
+
+    if owner_loss.is_lost() {
+        Err(ServerError::InvalidBootstrap(
+            "control-plane owner was lost".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sleep_until_runtime_event(next_renewal: Instant) {
+    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
+    thread::sleep(until_renewal.min(RUNTIME_EVENT_POLL));
+}
+
+/// Shutdown and owner-loss checks run at least this often while idle.
+const RUNTIME_EVENT_POLL: Duration = Duration::from_millis(10);
+
+/// Block until the listener has a pending connection, the next renewal is
+/// due, or the runtime poll interval elapses. A pending connection wakes the
+/// loop at once instead of waiting out a fixed sleep.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, next_renewal: Instant) {
+    use std::os::fd::AsRawFd;
+
+    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
+    let timeout = until_renewal.min(RUNTIME_EVENT_POLL);
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `descriptor` is one valid pollfd for a listener this function
+    // borrows for the whole call; poll writes only its `revents` field.
+    unsafe {
+        libc::poll(&mut descriptor, 1, timeout_ms);
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_connection(_listener: &TcpListener, next_renewal: Instant) {
+    sleep_until_runtime_event(next_renewal);
+}
+
+fn validate_ownership(
+    options: ServerOptions,
+    registry: &Arc<RootOwnerRegistry>,
+    ownership: &[ShardOwner],
+) -> Result<(), ServerError> {
+    options.validate()?;
+    if ownership.is_empty() {
+        return Err(ServerError::InvalidOptions(
+            "serving requires at least one logical-shard owner".to_owned(),
+        ));
+    }
+    let mut shards = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    for (index, owner) in ownership.iter().enumerate() {
+        if !owner.is_for_registry(registry) {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} belongs to another registry"
+            )));
+        }
+
+        if let Some(required) = owner.owner_lease_renew_interval() {
+            if required.is_zero() {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} declares a zero lease renewal interval"
+                )));
+            }
+
+            if options.lease_renew_interval != required {
+                return Err(ServerError::InvalidOptions(
+                    format!(
+                        "ownership entry {index} requires lease renewal interval {required:?}, but ServerOptions configures {:?}",
+                        options.lease_renew_interval,
+                    ),
+                ));
+            }
+        }
+
+        if !shards.insert(owner.shard_id()) {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} duplicates logical shard {:?}",
+                owner.shard_id()
+            )));
+        }
+        if owner.routes().is_empty() {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} has no root routes"
+            )));
+        }
+        for route in owner.routes() {
+            if route.logical_shard_id != nokv_protocol::LogicalShardIdentity::from(owner.shard_id())
+            {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} contains a route for another logical shard"
+                )));
+            }
+            if !roots.insert(route.root_id) {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} duplicates root route {:?}",
+                    route.root_id
+                )));
+            }
+            if !registry.contains_exact(*route)? {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} has no exact installed route for root {:?}",
+                    route.root_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) -> ServerError {
+    let preserve_control = matches!(&primary, ServerError::Control(_));
+
+    match release_ownership(ownership) {
+        Ok(()) => primary,
+        Err(_) if preserve_control => primary,
+        Err(cleanup) => ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: cleanup.to_string(),
+        },
+    }
+}
+
+/// Release every owner once. One owner's failure is returned as it is, so a
+/// typed control-plane cause, such as the control store refusing its
+/// directory, reaches the caller.
+fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
+    let mut failures = ownership
+        .into_iter()
+        .filter_map(|owner| owner.release().err())
+        .collect::<Vec<_>>();
+    if failures.len() <= 1 {
+        return failures.pop().map_or(Ok(()), Err);
+    }
+    Err(ServerError::BootstrapRollback {
+        primary: "release logical-shard ownership".to_owned(),
+        rollback: failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
+}
+
+fn serve_connection(
+    stream: TcpStream,
+    registry: Arc<RootOwnerRegistry>,
+    options: ServerOptions,
+    tls: Option<&RpcServerTls>,
+) -> Result<(), ServerError> {
+    // A response must not wait for the client's delayed ACK of an earlier
+    // segment. This runs per connection, not in the accept loop, so a failure
+    // closes only this connection.
+    stream.set_nodelay(true).map_err(ServerError::Connection)?;
+    let peer = stream.peer_addr().ok();
+    let Some((mut stream, principal)) = admit(stream, options.handshake_timeout, tls)? else {
+        return Ok(());
+    };
+    stream
+        .finish_admission(options.read_timeout, options.write_timeout)
+        .map_err(ServerError::Connection)?;
+    let mut denials_logged = 0_u32;
+    while let Some(request) = read_frame(&mut stream)? {
+        let request = decode_request(&request)?;
+        // Authorization comes before any route lookup, so a denied caller
+        // learns nothing about the root. The executor then records the
+        // authorized principal and checks it against what it continues.
+        let authority = match tls {
+            Some(tls) => {
+                let Some(principal) = &principal else {
+                    return Ok(());
+                };
+                match tls.access.authorize(principal, &request, unix_now()) {
+                    Ok(role) => RequestAuthority {
+                        principal: Some(principal.principal_id),
+                        role: Some(role),
+                    },
+                    Err(denial) => {
+                        log_denial(peer, principal, &request, denial, &mut denials_logged);
+                        tls.audit(&Refusal::request(
+                            denial,
+                            peer,
+                            tls.access.tenant_id(),
+                            principal,
+                            &request,
+                        ));
+                        write_frame(
+                            &mut stream,
+                            &encode_response(&denied_response(&request, denial))?,
+                        )?;
+                        if denial == AccessDenial::NotACurrentCredential {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+            None => RequestAuthority::TRUSTED,
+        };
+        let named = (classify(&request.operation).name, request.route.root_id);
+        let response = registry.dispatch_guarded(request, authority)?;
+        if let (Some(tls), Some(principal), WorkspaceRpcOutcome::Failure(failure)) =
+            (tls, &principal, &response.response().outcome)
+        {
+            // The executor answers PermissionDenied only to a principal that
+            // continues what another began.
+            if failure.code == ErrorCode::PermissionDenied {
+                tls.audit(&Refusal::not_the_initiator(
+                    peer,
+                    tls.access.tenant_id(),
+                    principal,
+                    (named.0, &named.1 .0),
+                    &failure.message,
+                ));
+            }
+        }
+        let encoded = encode_response_or_internal_failure(response.response())?;
+        write_frame(&mut stream, &encoded)?;
+        drop(response);
+        require_owner_retained(&registry.owner_loss_signal())?;
+    }
+    Ok(())
+}
+
+/// Denials on one connection are logged up to this many times; a client
+/// that keeps retrying a refused request does not flood the owner's log.
+const LOGGED_DENIALS_PER_CONNECTION: u32 = 3;
+
+fn log_denial(
+    peer: Option<std::net::SocketAddr>,
+    principal: &ConnectionPrincipal,
+    request: &WorkspaceRpcRequest,
+    denial: AccessDenial,
+    logged: &mut u32,
+) {
+    if *logged >= LOGGED_DENIALS_PER_CONNECTION {
+        return;
+    }
+    *logged += 1;
+    let reason = match denial {
+        AccessDenial::NotACurrentCredential => "its credential is no longer current".to_owned(),
+        AccessDenial::PermissionDenied { required } => format!("it holds no {required:?} role"),
+        AccessDenial::PolicyStale => "the tenant policy copy is stale".to_owned(),
+    };
+    let peer = peer.map_or(String::new(), |peer| format!(", peer {peer}"));
+    let more = if *logged == LOGGED_DENIALS_PER_CONNECTION {
+        "; further denials on this connection are not logged"
+    } else {
+        ""
+    };
+    eprintln!(
+        "nokv-server: denied {} on root {} to principal {}{peer}: {reason}{more}",
+        classify(&request.operation).name,
+        lowercase_hex(&request.route.root_id.0),
+        lowercase_hex(principal.principal_id.as_bytes()),
+    );
+}
+
+/// The failure for a request the connection's principal may not make. It
+/// carries no route hint, generation, or commit version.
+fn denied_response(request: &WorkspaceRpcRequest, denial: AccessDenial) -> WorkspaceRpcResponse {
+    let (code, message, retryable) = match denial {
+        AccessDenial::NotACurrentCredential => (
+            ErrorCode::Unauthenticated,
+            "the connection's certificate is no longer a current credential of the owner's tenant"
+                .to_owned(),
+            false,
+        ),
+        AccessDenial::PermissionDenied { required } => (
+            ErrorCode::PermissionDenied,
+            format!("the principal holds no role on this root that includes {required:?}"),
+            false,
+        ),
+        AccessDenial::PolicyStale => (
+            ErrorCode::Unauthenticated,
+            "the owner cannot refresh its tenant policy; retry later".to_owned(),
+            true,
+        ),
+    };
+    WorkspaceRpcResponse {
+        route: request.route,
+        request_id: request.request_id,
+        commit_version: None,
+        replayed: false,
+        outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+            code,
+            message,
+            retryable,
+            conflict: None,
+            current_generation: None,
+            route_hint: None,
+        }),
+    }
+}
+
+/// Encodes one response frame. A success projection that fails wire
+/// validation is a server-side defect, but the connection must not be dropped
+/// silently over it: the caller receives a typed, non-retryable `Internal`
+/// failure for the exact request instead of a truncated stream, and the defect
+/// is logged once here.
+fn encode_response_or_internal_failure(
+    response: &WorkspaceRpcResponse,
+) -> Result<Vec<u8>, ServerError> {
+    match encode_response(response) {
+        Ok(encoded) => Ok(encoded),
+        Err(ProtocolError::FrameTooLarge { bytes, max }) => {
+            Err(ServerError::FrameTooLarge { bytes, max })
+        }
+        Err(error) => {
+            eprintln!(
+                "nokv-server: response projection for request {:?} failed wire validation: {error}",
+                response.request_id
+            );
+            let failure = WorkspaceRpcResponse {
+                route: response.route,
+                request_id: response.request_id,
+                commit_version: None,
+                replayed: false,
+                outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                    code: ErrorCode::Internal,
+                    message: format!("response projection failed wire validation: {error}"),
+                    retryable: false,
+                    conflict: None,
+                    current_generation: None,
+                    route_hint: None,
+                }),
+            };
+            Ok(encode_response(&failure)?)
+        }
+    }
+}
+
+/// Admit one connection, or answer it with a refusal and return `None`. TLS
+/// and the protocol handshake share one deadline.
+fn admit(
+    stream: TcpStream,
+    timeout: Duration,
+    tls: Option<&RpcServerTls>,
+) -> Result<Option<(RpcStream, Option<ConnectionPrincipal>)>, ServerError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| ServerError::InvalidOptions("handshake deadline overflows".to_owned()))?;
+    let mut socket = DeadlineSocket {
+        socket: stream,
+        deadline: Some(deadline),
+    };
+    let Some(first) = socket.peek_first_byte().map_err(ServerError::Connection)? else {
+        return Ok(None);
+    };
+    match (tls, opens_tls_record(first)) {
+        (Some(tls), true) => admit_tls(socket, tls),
+        (None, true) => {
+            // A TLS client reads this plaintext answer before parsing records.
+            drain_tls_record(&mut socket).map_err(ServerError::Connection)?;
+            write_handshake(&mut socket, HandshakeKind::TlsUnavailable)?;
+            log_refusal(&socket.socket, "a TLS client; this owner serves plaintext");
+            Ok(None)
+        }
+        (tls, false) => {
+            Ok(admit_plaintext(&mut socket, tls)?.then_some((RpcStream::Plain(socket), None)))
+        }
+    }
+}
+
+/// Answer a plaintext first frame. A hello for the current schema is accepted
+/// only when the owner does not require TLS; an older protocol gets its
+/// readable rejection.
+fn admit_plaintext(
+    socket: &mut DeadlineSocket,
+    tls: Option<&RpcServerTls>,
+) -> Result<bool, ServerError> {
+    let tls_required = tls.is_some();
+    let mut length = [0_u8; 4];
+    socket
+        .read_exact(&mut length)
+        .map_err(ServerError::Connection)?;
+    let length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| ServerError::InvalidOptions("frame length does not fit usize".to_owned()))?;
+    if length > MAX_FRAME_BYTES {
+        return Err(ServerError::FrameTooLarge {
+            bytes: length,
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    if length != HANDSHAKE_PAYLOAD_BYTES && length > MAX_LEGACY_FIRST_FRAME_BYTES {
+        return Ok(false);
+    }
+
+    if length == HANDSHAKE_PAYLOAD_BYTES {
+        let mut payload = [0_u8; HANDSHAKE_PAYLOAD_BYTES];
+        socket
+            .read_exact(&mut payload)
+            .map_err(ServerError::Connection)?;
+        if has_handshake_magic(&payload) {
+            let hello = decode_handshake_payload(&payload)?;
+            if hello.kind() != HandshakeKind::ClientHello {
+                return Ok(false);
+            }
+            let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
+                HandshakeKind::Incompatible
+            } else if tls_required {
+                HandshakeKind::TlsRequired
+            } else {
+                HandshakeKind::Accepted
+            };
+            write_handshake(socket, verdict)?;
+            match verdict {
+                HandshakeKind::TlsRequired => {
+                    log_refusal(
+                        &socket.socket,
+                        "a plaintext client; this owner requires TLS",
+                    );
+                    audit_connection(tls, &socket.socket, RefusalReason::TlsRequired);
+                }
+                HandshakeKind::Incompatible => {
+                    log_refusal(&socket.socket, "a client speaking another protocol schema");
+                    audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
+                }
+                _ => {}
+            }
+            return Ok(verdict == HandshakeKind::Accepted);
+        }
+        write_legacy_rejection(socket, &payload)?;
+        audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
+        return Ok(false);
+    }
+
+    let mut first_frame = vec![0_u8; length];
+    socket
+        .read_exact(&mut first_frame)
+        .map_err(ServerError::Connection)?;
+    write_legacy_rejection(socket, &first_frame)?;
+    audit_connection(tls, &socket.socket, RefusalReason::IncompatibleSchema);
+    Ok(false)
+}
+
+/// Record a refused plaintext connection when a TLS owner keeps an audit log.
+fn audit_connection(tls: Option<&RpcServerTls>, socket: &TcpStream, reason: RefusalReason) {
+    if let Some(tls) = tls {
+        tls.audit(&Refusal::connection(
+            reason,
+            socket.peer_addr().ok(),
+            tls.access.tenant_id(),
+        ));
+    }
+}
+
+/// Complete TLS, then the protocol handshake inside it. A current schema from
+/// a client whose certificate is not a current credential of the tenant gets
+/// `Unauthenticated`. A failure to read the tenant's records closes the
+/// connection unanswered, and the client retries it.
+fn admit_tls(
+    socket: DeadlineSocket,
+    tls: &RpcServerTls,
+) -> Result<Option<(RpcStream, Option<ConnectionPrincipal>)>, ServerError> {
+    let peer = socket.socket.peer_addr().ok();
+    let tenant_id = tls.access.tenant_id();
+    let (mut stream, certificate) = match accept_tls(socket, tls) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            let detail = error.to_string();
+            tls.audit(
+                &Refusal::connection(RefusalReason::TlsHandshakeFailed, peer, tenant_id)
+                    .with_detail(&detail),
+            );
+            return Err(error);
+        }
+    };
+    let fingerprint = CredentialFingerprint::from_bytes(Sha256::digest(&certificate).into());
+    let refused =
+        |reason| Refusal::connection(reason, peer, tenant_id).with_certificate(&fingerprint);
+    let mut hello = [0_u8; HANDSHAKE_FRAME_BYTES];
+    stream
+        .read_exact(&mut hello)
+        .map_err(ServerError::Connection)?;
+    let hello = decode_handshake_frame(&hello)?;
+    if hello.kind() != HandshakeKind::ClientHello {
+        return Ok(None);
+    }
+    let mut principal = None;
+    let verdict = if hello.operation_schema() != WORKSPACE_PROTOCOL_SCHEMA {
+        log_refusal(
+            &stream.sock.socket,
+            "a client speaking another protocol schema",
+        );
+        tls.audit(&refused(RefusalReason::IncompatibleSchema));
+        HandshakeKind::Incompatible
+    } else {
+        match tls.access.authenticate(&certificate, unix_now()) {
+            Ok(authenticated) => {
+                principal = Some(authenticated);
+                HandshakeKind::Accepted
+            }
+            // Unanswered, so the client retries once the policy refreshes.
+            Err(AccessDenial::PolicyStale) => {
+                log_refusal(
+                    &stream.sock.socket,
+                    "a TLS client while the tenant policy copy is stale; left unanswered",
+                );
+                tls.audit(&refused(RefusalReason::PolicyStale));
+                return Ok(None);
+            }
+            Err(denial) => {
+                // The fingerprint lets an operator register the certificate.
+                log_refusal(
+                    &stream.sock.socket,
+                    &format!(
+                        "a TLS client whose certificate {} is not a current credential of the tenant",
+                        lowercase_hex(fingerprint.as_bytes())
+                    ),
+                );
+                tls.audit(&refused(denial.into()));
+                HandshakeKind::Unauthenticated
+            }
+        }
+    };
+    write_handshake(&mut stream, verdict)?;
+    if verdict != HandshakeKind::Accepted {
+        stream.conn.send_close_notify();
+        stream.flush().map_err(ServerError::Connection)?;
+        return Ok(None);
+    }
+    Ok(Some((RpcStream::Tls(Box::new(stream)), principal)))
+}
+
+/// One line per refused connection, so an operator sees who was turned away
+/// and why without any client-side evidence.
+fn log_refusal(socket: &TcpStream, what: &str) {
+    match socket.peer_addr() {
+        Ok(peer) => eprintln!("nokv-server: refused {what} (peer {peer})"),
+        Err(_) => eprintln!("nokv-server: refused {what}"),
+    }
+}
+
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Seconds since the Unix epoch; a clock before it expires every credential.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+}
+
+fn write_handshake(stream: &mut impl Write, kind: HandshakeKind) -> Result<(), ServerError> {
+    let answer = WorkspaceHandshake::new(kind, WORKSPACE_PROTOCOL_SCHEMA)
+        .expect("the compiled workspace protocol schema fits the handshake");
+    stream
+        .write_all(&encode_handshake_frame(&answer)?)
+        .and_then(|()| stream.flush())
+        .map_err(ServerError::Connection)
+}
+
+fn write_legacy_rejection(stream: &mut impl Write, first_frame: &[u8]) -> Result<(), ServerError> {
+    let Some(response) = legacy_rejection_response(first_frame) else {
+        return Ok(());
+    };
+    stream
+        .write_all(&length_prefixed_frame(&response)?)
+        .map_err(ServerError::Connection)
+}
+
+fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ServerError> {
+    let mut length = [0_u8; 4];
+    loop {
+        match reader.read(&mut length[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(ServerError::Connection(error)),
+        }
+    }
+    reader
+        .read_exact(&mut length[1..])
+        .map_err(ServerError::Connection)?;
+    let length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| ServerError::InvalidOptions("frame length does not fit usize".to_owned()))?;
+    if length > MAX_FRAME_BYTES {
+        return Err(ServerError::FrameTooLarge {
+            bytes: length,
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    let mut frame = vec![0_u8; length];
+    reader
+        .read_exact(&mut frame)
+        .map_err(ServerError::Connection)?;
+    Ok(Some(frame))
+}
+
+fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), ServerError> {
+    writer
+        .write_all(&length_prefixed_frame(frame)?)
+        .map_err(ServerError::Connection)?;
+    writer.flush().map_err(ServerError::Connection)
+}
+
+/// Builds one complete frame, the four-byte big-endian length followed by the
+/// payload, so it leaves in a single write. Writing the prefix on its own lets
+/// Nagle's algorithm hold the payload until the client acknowledges the prefix,
+/// and delayed ACK postpones that acknowledgement by tens of milliseconds.
+fn length_prefixed_frame(payload: &[u8]) -> Result<Vec<u8>, ServerError> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(ServerError::FrameTooLarge {
+            bytes: payload.len(),
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    let length = u32::try_from(payload.len())
+        .map_err(|_| ServerError::InvalidOptions("frame length exceeds u32".to_owned()))?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::net::Shutdown;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
+
+    use nokv_protocol::{
+        decode_handshake_frame, decode_response, encode_handshake_frame, encode_request,
+        CreateWorkspaceRequest, HandshakeKind, LogicalShardIdentity, ObjectNamespaceIdentity,
+        RequestIdentity, RootIdentity, RootRoute, RpcFailure, WorkbenchName, WorkspaceHandshake,
+        WorkspaceIdentity, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
+        WorkspaceRpcRequest, WorkspaceSummary, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES,
+    };
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::{ExecutedRequest, WorkspaceRequestExecutor};
+
+    struct CountingExecutor {
+        calls: AtomicUsize,
+        last_authority: Mutex<Option<RequestAuthority>>,
+    }
+
+    impl WorkspaceRequestExecutor for CountingExecutor {
+        fn execute(
+            &self,
+            request: &WorkspaceRpcRequest,
+            authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            *self.last_authority.lock().unwrap() = Some(authority);
+            let WorkspaceRequest::CreateWorkspace(create) = &request.operation else {
+                panic!("test executor received an unexpected operation");
+            };
+            Ok(ExecutedRequest {
+                result: WorkspaceResult::Workspace(WorkspaceSummary {
+                    workbench: create.workbench.clone(),
+                    workspace_incarnation_id: create.workspace_incarnation_id,
+                    workspace_revision: 0,
+                    commit_head: None,
+                    commit_head_generation: None,
+                }),
+                commit_version: Some(9),
+                replayed: false,
+            })
+        }
+    }
+
+    fn options() -> ServerOptions {
+        ServerOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            handshake_timeout: Duration::from_millis(100),
+            read_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            lease_renew_interval: Duration::from_secs(1),
+            max_inflight_connections: 8,
+        }
+    }
+
+    fn route() -> RootRoute {
+        RootRoute {
+            root_id: RootIdentity([1; 16]),
+            logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: ObjectNamespaceIdentity([3; 16]),
+            placement_generation: 7,
+            owner_epoch: 11,
+        }
+    }
+
+    fn request() -> WorkspaceRpcRequest {
+        WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([4; 16]),
+            operation: WorkspaceRequest::CreateWorkspace(CreateWorkspaceRequest {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                workspace_incarnation_id: WorkspaceIdentity([5; 16]),
+            }),
+        }
+    }
+
+    #[test]
+    fn invalid_success_projection_becomes_a_typed_internal_failure_frame() {
+        // A success result whose projection violates the wire contract must
+        // reach the caller as an `Internal` failure for the exact request, not
+        // as a dropped connection.
+        let request = request();
+        let invalid = WorkspaceRpcResponse {
+            route: request.route,
+            request_id: request.request_id,
+            commit_version: Some(3),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Workspace(
+                WorkspaceSummary {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    workspace_incarnation_id: WorkspaceIdentity([5; 16]),
+                    workspace_revision: 1,
+                    commit_head: None,
+                    commit_head_generation: Some(1),
+                },
+            ))),
+        };
+        assert!(encode_response(&invalid).is_err());
+
+        let encoded = encode_response_or_internal_failure(&invalid).unwrap();
+        let decoded = decode_response(&encoded).unwrap();
+        assert_eq!(decoded.route, request.route);
+        assert_eq!(decoded.request_id, request.request_id);
+        assert_eq!(decoded.commit_version, None);
+        assert!(!decoded.replayed);
+        let WorkspaceRpcOutcome::Failure(failure) = decoded.outcome else {
+            panic!("invalid projection must surface as a failure envelope");
+        };
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(!failure.retryable);
+        assert!(failure
+            .message
+            .contains("response projection failed wire validation"));
+
+        let valid = WorkspaceRpcResponse {
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Workspace(
+                WorkspaceSummary {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    workspace_incarnation_id: WorkspaceIdentity([5; 16]),
+                    workspace_revision: 1,
+                    commit_head: None,
+                    commit_head_generation: None,
+                },
+            ))),
+            ..invalid
+        };
+        assert_eq!(
+            encode_response_or_internal_failure(&valid).unwrap(),
+            encode_response(&valid).unwrap()
+        );
+    }
+
+    fn streams() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn registry() -> (Arc<RootOwnerRegistry>, Arc<CountingExecutor>) {
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let executor = Arc::new(CountingExecutor {
+            calls: AtomicUsize::new(0),
+            last_authority: Mutex::new(None),
+        });
+        registry.install(route(), executor.clone()).unwrap();
+        (registry, executor)
+    }
+
+    #[test]
+    fn frame_round_trips_exact_bytes() {
+        let expected = b"workspace request";
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, expected).unwrap();
+        let mut cursor = Cursor::new(encoded);
+        assert_eq!(read_frame(&mut cursor).unwrap(), Some(expected.to_vec()));
+        assert_eq!(read_frame(&mut cursor).unwrap(), None);
+    }
+
+    /// Writer that keeps every `write` call as a separate entry.
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn response_frame_leaves_in_one_write() {
+        let response = b"workspace response";
+        let mut writer = RecordingWriter::default();
+        write_frame(&mut writer, response).unwrap();
+
+        let mut expected = (response.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(response);
+        assert_eq!(writer.writes, vec![expected]);
+    }
+
+    #[test]
+    fn oversized_outbound_frame_is_rejected_before_writing() {
+        let mut writer = RecordingWriter::default();
+        assert!(matches!(
+            write_frame(&mut writer, &vec![0_u8; MAX_FRAME_BYTES + 1]),
+            Err(ServerError::FrameTooLarge { .. })
+        ));
+        assert!(writer.writes.is_empty());
+    }
+
+    #[test]
+    fn accepted_connection_disables_nagle() {
+        let (mut client, server) = streams();
+        let accepted = server.try_clone().unwrap();
+        assert!(!accepted.nodelay().unwrap());
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut reply = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&reply).unwrap().kind(),
+            HandshakeKind::Accepted
+        );
+        assert!(accepted.nodelay().unwrap());
+
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn oversized_inbound_frame_is_rejected_before_allocation() {
+        let encoded = u32::try_from(MAX_FRAME_BYTES + 1)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        assert!(matches!(
+            read_frame(&mut Cursor::new(encoded)),
+            Err(ServerError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_handshake_preserves_multiple_operation_frames_on_one_connection() {
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut accepted = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut accepted).unwrap();
+        let accepted = decode_handshake_frame(&accepted).unwrap();
+        assert_eq!(accepted.kind(), HandshakeKind::Accepted);
+        assert_eq!(accepted.operation_schema(), WORKSPACE_PROTOCOL_SCHEMA);
+
+        for _ in 0..2 {
+            write_frame(&mut client, &encode_request(&request()).unwrap()).unwrap();
+            let response = read_frame(&mut client).unwrap().unwrap();
+            let response = decode_response(&response).unwrap();
+            assert!(matches!(response.outcome, WorkspaceRpcOutcome::Success(_)));
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn operation_first_v3_gets_a_readable_rejection_with_zero_dispatch() {
+        #[derive(Serialize)]
+        struct V3Frame {
+            schema: &'static str,
+            payload: WorkspaceRpcRequest,
+        }
+
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let legacy = rmp_serde::to_vec_named(&V3Frame {
+            schema: crate::legacy_rejection::LEGACY_V3_SCHEMA,
+            payload: request(),
+        })
+        .unwrap();
+        write_frame(&mut client, &legacy).unwrap();
+        let response = read_frame(&mut client).unwrap().unwrap();
+        let response = decode_response(&response).unwrap();
+        let WorkspaceRpcOutcome::Failure(failure) = response.outcome else {
+            panic!("legacy operation-first request must be rejected");
+        };
+        assert_eq!(failure.code, nokv_protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.message,
+            crate::legacy_rejection::LEGACY_CLIENT_UPGRADE_MESSAGE
+        );
+        assert!(!failure.retryable);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn operation_first_public_v2_gets_a_readable_rejection_with_zero_dispatch() {
+        #[derive(Serialize)]
+        struct V2Frame<'a> {
+            schema: &'static str,
+            payload: V2Request<'a>,
+        }
+        #[derive(Serialize)]
+        struct V2Request<'a> {
+            route: V2Route,
+            request_id: [u8; 16],
+            operation: &'a WorkspaceRequest,
+        }
+        #[derive(Clone, Copy, Serialize)]
+        struct V2Route {
+            root_id: [u8; 16],
+            logical_shard_id: [u8; 16],
+            placement_generation: u64,
+            owner_epoch: u64,
+        }
+        #[derive(Deserialize)]
+        struct V2ResponseFrame {
+            schema: String,
+            #[serde(rename = "payload")]
+            _payload: serde::de::IgnoredAny,
+        }
+
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+        let operation = request().operation;
+        let encoded = rmp_serde::to_vec_named(&V2Frame {
+            schema: crate::legacy_rejection::LEGACY_V2_SCHEMA,
+            payload: V2Request {
+                route: V2Route {
+                    root_id: [1; 16],
+                    logical_shard_id: [2; 16],
+                    placement_generation: 7,
+                    owner_epoch: 11,
+                },
+                request_id: [4; 16],
+                operation: &operation,
+            },
+        })
+        .unwrap();
+        write_frame(&mut client, &encoded).unwrap();
+        let response = read_frame(&mut client).unwrap().unwrap();
+        let decoded: V2ResponseFrame = rmp_serde::from_slice(&response).unwrap();
+        assert_eq!(decoded.schema, crate::legacy_rejection::LEGACY_V2_SCHEMA);
+        assert!(response
+            .windows(crate::legacy_rejection::LEGACY_CLIENT_UPGRADE_MESSAGE.len())
+            .any(|window| {
+                window == crate::legacy_rejection::LEGACY_CLIENT_UPGRADE_MESSAGE.as_bytes()
+            }));
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn v7_hello_gets_v10_incompatible_and_zero_dispatch() {
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v7").unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut response = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut response).unwrap();
+        let response = decode_handshake_frame(&response).unwrap();
+        assert_eq!(response.kind(), HandshakeKind::Incompatible);
+        assert_eq!(response.operation_schema(), WORKSPACE_PROTOCOL_SCHEMA);
+        assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn matched_but_corrupt_handshake_magic_never_enters_legacy_classification() {
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let mut corrupt = [0_u8; HANDSHAKE_PAYLOAD_BYTES];
+        corrupt[..8].copy_from_slice(b"NOKVHS1\0");
+        corrupt[8] = HandshakeKind::ClientHello as u8;
+        corrupt[9] = WORKSPACE_PROTOCOL_SCHEMA.len() as u8;
+        corrupt[10] = 1;
+        corrupt[16..16 + WORKSPACE_PROTOCOL_SCHEMA.len()]
+            .copy_from_slice(WORKSPACE_PROTOCOL_SCHEMA.as_bytes());
+        client
+            .write_all(&(HANDSHAKE_PAYLOAD_BYTES as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&corrupt).unwrap();
+        assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+        assert!(serving.join().unwrap().is_err());
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handshake_deadline_cannot_be_extended_by_partial_prefix_reads() {
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let serving = thread::spawn(move || {
+            let result = serve_connection(server, registry, options(), None);
+            completed_tx.send(()).unwrap();
+            result
+        });
+
+        client.write_all(&[0]).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_millis(400))
+            .expect("absolute handshake deadline must close a partial first frame");
+        drop(client);
+        assert!(serving.join().unwrap().is_err());
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn global_connection_permit_is_released_by_raii() {
+        let limiter = Arc::new(ConnectionLimiter::new(1).unwrap());
+        let permit = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none());
+        drop(permit);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn graceful_shutdown_before_accept_returns_without_admitting_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = AtomicBool::new(true);
+        let owner_loss = OwnerLossSignal::default();
+        let (registry, _) = registry();
+        let renewals = AtomicUsize::new(0);
+
+        serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            None,
+            owner_loss,
+            &shutdown,
+            || {
+                renewals.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(renewals.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_accepted_connections_while_renewing_ownership() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let owner_loss = OwnerLossSignal::default();
+        let (registry, _) = registry();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let mut runtime_options = options();
+        runtime_options.read_timeout = Duration::from_secs(5);
+        runtime_options.lease_renew_interval = Duration::from_millis(5);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_renewals = Arc::clone(&renewals);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (renewed_tx, renewed_rx) = mpsc::channel();
+        let serving = thread::spawn(move || {
+            let result = serve_socket_loop(
+                listener,
+                runtime_options,
+                registry,
+                None,
+                owner_loss,
+                worker_shutdown.as_ref(),
+                || {
+                    let count = worker_renewals.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    renewed_tx.send(count).unwrap();
+                    Ok(())
+                },
+            );
+            completed_tx.send(()).unwrap();
+            result
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut accepted = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut accepted).unwrap();
+        assert_eq!(renewed_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        shutdown.store(true, AtomicOrdering::Release);
+
+        assert!(renewed_rx.recv_timeout(Duration::from_secs(1)).unwrap() > 1);
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        client.shutdown(Shutdown::Both).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drain must finish after the accepted connection exits");
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn owner_loss_precedes_an_already_requested_graceful_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = AtomicBool::new(true);
+        let owner_loss = OwnerLossSignal::default();
+        owner_loss.fail_closed();
+        let (registry, _) = registry();
+
+        let error = serve_socket_loop(
+            listener,
+            options(),
+            registry,
+            None,
+            owner_loss,
+            &shutdown,
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner was lost"));
+    }
+
+    #[test]
+    fn oversized_legacy_first_frame_closes_before_reading_or_dispatching_its_body() {
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        client
+            .write_all(
+                &u32::try_from(MAX_LEGACY_FIRST_FRAME_BYTES + 1)
+                    .unwrap()
+                    .to_be_bytes(),
+            )
+            .unwrap();
+        assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Open TLS over `client` and offer the current schema; the owner's
+    /// answer, or the TLS or I/O failure that came first.
+    fn tls_hello(
+        client: TcpStream,
+        config: Arc<rustls::ClientConfig>,
+    ) -> (
+        rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        std::io::Result<HandshakeKind>,
+    ) {
+        let connection =
+            rustls::ClientConnection::new(config, crate::rpc_tls::test_pki::server_name()).unwrap();
+        let mut stream = rustls::StreamOwned::new(connection, client);
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        let answer = stream
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .and_then(|()| stream.flush())
+            .and_then(|()| {
+                let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+                stream.read_exact(&mut answer)?;
+                Ok(decode_handshake_frame(&answer).unwrap().kind())
+            });
+        (stream, answer)
+    }
+
+    fn tls_options() -> ServerOptions {
+        // Debug-build key exchange alone can exceed the 100 ms test default.
+        ServerOptions {
+            handshake_timeout: Duration::from_secs(5),
+            ..options()
+        }
+    }
+
+    #[test]
+    fn an_authenticated_tls_client_reaches_dispatch() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        write_frame(&mut stream, &encode_request(&request()).unwrap()).unwrap();
+        let response = decode_response(&read_frame(&mut stream).unwrap().unwrap()).unwrap();
+        assert!(matches!(response.outcome, WorkspaceRpcOutcome::Success(_)));
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_unregistered_certificate_is_unauthenticated_with_zero_dispatch() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.unregistered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Unauthenticated);
+        // The owner ends TLS after its answer and reads nothing more.
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_tls_client_without_a_certificate_never_reaches_the_protocol() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (_, answer) = tls_hello(client, pki.client_config(None));
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(serving.join().unwrap().is_err());
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_plaintext_hello_to_a_tls_owner_is_answered_tls_required() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&answer).unwrap().kind(),
+            HandshakeKind::TlsRequired
+        );
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_older_schema_learns_it_is_incompatible_before_it_learns_about_tls() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v14").unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        let answer = decode_handshake_frame(&answer).unwrap();
+        assert_eq!(answer.kind(), HandshakeKind::Incompatible);
+        assert_eq!(answer.operation_schema(), WORKSPACE_PROTOCOL_SCHEMA);
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Send `request` on an admitted TLS stream and decode the answer.
+    fn tls_exchange(
+        stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        request: &WorkspaceRpcRequest,
+    ) -> WorkspaceRpcResponse {
+        write_frame(stream, &encode_request(request).unwrap()).unwrap();
+        decode_response(&read_frame(stream).unwrap().unwrap()).unwrap()
+    }
+
+    fn failure_of(response: &WorkspaceRpcResponse) -> &RpcFailure {
+        let WorkspaceRpcOutcome::Failure(failure) = &response.outcome else {
+            panic!("expected a failure, got {:?}", response.outcome);
+        };
+        failure
+    }
+
+    #[test]
+    fn an_authorized_request_reaches_the_executor_with_its_principal_and_role() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(
+            *executor.last_authority.lock().unwrap(),
+            Some(RequestAuthority {
+                principal: Some(nokv_types::PrincipalId::from_bytes([6; 16])),
+                role: Some(nokv_types::Role::Writer),
+            })
+        );
+    }
+
+    #[test]
+    fn a_reader_is_refused_a_write_without_a_route_hint_and_keeps_its_connection() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving =
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)));
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.reader)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        for _ in 0..2 {
+            let response = tls_exchange(&mut stream, &request());
+            let failure = failure_of(&response);
+            assert_eq!(failure.code, ErrorCode::PermissionDenied);
+            assert!(!failure.retryable);
+            assert_eq!(failure.route_hint, None);
+            assert_eq!(response.route, request().route);
+            assert_eq!(response.commit_version, None);
+        }
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn every_refusal_of_a_tls_owner_is_appended_to_its_audit_log() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let tls = Arc::new(
+            pki.server_tls()
+                .with_audit_log(crate::AuditLog::open(&path).unwrap()),
+        );
+        let serve = |server| {
+            let tls = Arc::clone(&tls);
+            let (registry, _) = registry();
+            thread::spawn(move || serve_connection(server, registry, tls_options(), Some(&tls)))
+        };
+
+        // A plaintext client.
+        let (mut client, server) = streams();
+        let serving = serve(server);
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        serving.join().unwrap().unwrap();
+
+        // A certificate that is no credential of the tenant.
+        let (client, server) = streams();
+        let serving = serve(server);
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.unregistered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Unauthenticated);
+        stream.read_to_end(&mut Vec::new()).unwrap();
+        serving.join().unwrap().unwrap();
+
+        // No certificate at all.
+        let (client, server) = streams();
+        let serving = serve(server);
+        assert!(tls_hello(client, pki.client_config(None)).1.is_err());
+        assert!(serving.join().unwrap().is_err());
+
+        // A reader's write.
+        let (client, server) = streams();
+        let serving = serve(server);
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.reader)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::PermissionDenied);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+
+        let lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let summary = lines
+            .iter()
+            .map(|line| (line["event"].as_str(), line["reason"].as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (Some("connection_refused"), Some("tls_required")),
+                (Some("connection_refused"), Some("not_a_current_credential")),
+                (Some("connection_refused"), Some("tls_handshake_failed")),
+                (Some("request_denied"), Some("permission_denied")),
+            ]
+        );
+        let tenant = lowercase_hex(crate::rpc_tls::test_pki::TENANT.as_bytes());
+        for line in &lines {
+            assert_eq!(line["tenant_id"], tenant.as_str());
+            assert!(line["peer"].as_str().is_some(), "{line}");
+        }
+        assert_eq!(
+            lines[1]["certificate_fingerprint"],
+            lowercase_hex(pki.unregistered.fingerprint().as_bytes()).as_str()
+        );
+        assert!(lines[2]["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()));
+        let denied = &lines[3];
+        let class = classify(&request().operation);
+        assert_eq!(denied["principal_id"], "07".repeat(16).as_str());
+        assert_eq!(
+            denied["certificate_fingerprint"],
+            lowercase_hex(pki.reader.fingerprint().as_bytes()).as_str()
+        );
+        assert_eq!(
+            denied["root_id"],
+            lowercase_hex(&request().route.root_id.0).as_str()
+        );
+        assert_eq!(denied["request"], class.name);
+        assert_eq!(denied["required_role"], class.role.name());
+    }
+
+    /// Refuses every request the way the executor refuses a principal that
+    /// continues an operation another began.
+    struct NotTheInitiatorExecutor;
+
+    const NOT_THE_INITIATOR: &str = "the principal did not begin this operation";
+
+    impl WorkspaceRequestExecutor for NotTheInitiatorExecutor {
+        fn execute(
+            &self,
+            _request: &WorkspaceRpcRequest,
+            _authority: RequestAuthority,
+        ) -> Result<ExecutedRequest, RpcFailure> {
+            Err(RpcFailure {
+                code: ErrorCode::PermissionDenied,
+                message: NOT_THE_INITIATOR.to_owned(),
+                retryable: false,
+                conflict: None,
+                current_generation: None,
+                route_hint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_continuation_the_executor_refuses_is_audited() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let tls = Arc::new(
+            pki.server_tls()
+                .with_audit_log(crate::AuditLog::open(&path).unwrap()),
+        );
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry
+            .install(route(), Arc::new(NotTheInitiatorExecutor))
+            .unwrap();
+        let (client, server) = streams();
+        let serving_tls = Arc::clone(&tls);
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::PermissionDenied);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = serde_json::from_str::<serde_json::Value>(text.trim()).unwrap();
+        assert_eq!(line["event"], "request_denied");
+        assert_eq!(line["reason"], "not_the_initiator");
+        assert_eq!(line["principal_id"], "06".repeat(16).as_str());
+        assert_eq!(
+            line["root_id"],
+            lowercase_hex(&request().route.root_id.0).as_str()
+        );
+        assert_eq!(line["request"], classify(&request().operation).name);
+        assert_eq!(line["required_role"], serde_json::Value::Null);
+        assert_eq!(line["detail"], NOT_THE_INITIATOR);
+    }
+
+    #[test]
+    fn a_credential_revoked_mid_connection_is_refused_once_and_the_connection_closes() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (tls, store) = pki.server_tls_with_store();
+        let tls = Arc::new(tls);
+        let serving_tls = Arc::clone(&tls);
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+
+        use nokv_control::IdentityStore as _;
+        store
+            .revoke_credential(
+                &crate::rpc_tls::test_pki::TENANT,
+                &pki.registered.fingerprint(),
+            )
+            .unwrap();
+        tls.access.refresh().unwrap();
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::Unauthenticated);
+        assert!(!failure_of(&response).retryable);
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap_or(0), 0);
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stale_policy_refuses_requests_with_a_retryable_failure() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = Arc::new(pki.server_tls());
+        let serving_tls = Arc::clone(&tls);
+        let (client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            serve_connection(server, registry, tls_options(), Some(&serving_tls))
+        });
+
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        tls.access
+            .age_for_test(tls.access.max_age() + Duration::from_secs(1));
+        let response = tls_exchange(&mut stream, &request());
+        assert_eq!(failure_of(&response).code, ErrorCode::Unauthenticated);
+        assert!(failure_of(&response).retryable);
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_serving_loop_applies_a_revoked_role_within_its_refresh_interval() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (tls, store) = pki.server_tls_with_store();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (registry, executor) = registry();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let serving_shutdown = Arc::clone(&shutdown);
+        let serving = thread::spawn(move || {
+            serve_socket_loop(
+                listener,
+                tls_options(),
+                registry,
+                Some(Arc::new(tls)),
+                OwnerLossSignal::default(),
+                serving_shutdown.as_ref(),
+                || Ok(()),
+            )
+        });
+
+        let client = TcpStream::connect(endpoint).unwrap();
+        let (mut stream, answer) = tls_hello(client, pki.client_config(Some(&pki.registered)));
+        assert_eq!(answer.unwrap(), HandshakeKind::Accepted);
+        assert!(matches!(
+            tls_exchange(&mut stream, &request()).outcome,
+            WorkspaceRpcOutcome::Success(_)
+        ));
+
+        use nokv_control::IdentityStore as _;
+        store
+            .revoke_role(&nokv_control::RoleBinding {
+                tenant_id: crate::rpc_tls::test_pki::TENANT,
+                principal_id: nokv_types::PrincipalId::from_bytes([6; 16]),
+                role: nokv_types::Role::Writer,
+                scope: nokv_types::RoleScope::Tenant,
+            })
+            .unwrap();
+        let revoked = Instant::now();
+        let mut refused = None;
+        while revoked.elapsed() < POLICY_REFRESH_INTERVAL * 3 {
+            let response = tls_exchange(&mut stream, &request());
+            if let WorkspaceRpcOutcome::Failure(failure) = &response.outcome {
+                assert_eq!(failure.code, ErrorCode::PermissionDenied);
+                refused = Some(revoked.elapsed());
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let refused = refused.expect("the revoked role was never applied");
+        assert!(refused <= POLICY_REFRESH_INTERVAL * 2, "{refused:?}");
+
+        stream.conn.send_close_notify();
+        stream.flush().unwrap();
+        drop(stream);
+        shutdown.store(true, AtomicOrdering::Release);
+        serving.join().unwrap().unwrap();
+        assert!(executor.calls.load(AtomicOrdering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn a_tls_hello_to_a_plaintext_owner_is_answered_in_plaintext() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || serve_connection(server, registry, options(), None));
+
+        let mut connection = rustls::ClientConnection::new(
+            pki.client_config(Some(&pki.registered)),
+            crate::rpc_tls::test_pki::server_name(),
+        )
+        .unwrap();
+        while connection.wants_write() {
+            connection.write_tls(&mut client).unwrap();
+        }
+        let mut answer = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut answer).unwrap();
+        assert_eq!(
+            decode_handshake_frame(&answer).unwrap().kind(),
+            HandshakeKind::TlsUnavailable
+        );
+        serving.join().unwrap().unwrap();
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_trickling_tls_client_cannot_hold_admission_open() {
+        let pki = crate::rpc_tls::test_pki::TestPki::new();
+        let tls = pki.server_tls();
+        let (mut client, server) = streams();
+        let (registry, executor) = registry();
+        let serving = thread::spawn(move || {
+            let started = Instant::now();
+            let result = serve_connection(server, registry, options(), Some(&tls));
+            (result, started.elapsed())
+        });
+
+        // A TLS record header that promises a long record, then one byte at a
+        // time: each read makes progress, the record never completes.
+        client.write_all(&[22, 3, 1, 0x40, 0x00]).unwrap();
+        for _ in 0..100 {
+            thread::sleep(Duration::from_millis(20));
+            if client.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+        let (result, elapsed) = serving.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(executor.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+}

@@ -1,0 +1,35 @@
+[package]
+name = "nokv-server"
+version = "0.1.0"
+description = "Logical-shard owner RPC server for NoKV Agent workspaces."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+etcd = ["nokv-control/etcd"]
+restore-crash-test-support = []
+
+[dependencies]
+libc.workspace = true
+nokv-control.workspace = true
+nokv-meta.workspace = true
+nokv-meta-holt.workspace = true
+nokv-meta-store.workspace = true
+nokv-object.workspace = true
+nokv-protocol.workspace = true
+nokv-types.workspace = true
+rmp-serde.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+nokv-meta-holt = { workspace = true, features = ["test-support"] }
+rcgen.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,74 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Change Governance
+
+on:
+  pull_request_target:
+    branches: [ "main" ]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+# The target workflow is loaded from the protected default branch. It never
+# checks out or executes pull-request code. The policy and its tests are fetched
+# from the exact base SHA, and the native job conclusion is the required check.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: change-governance-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Keep the native job name stable because branch protection requires it.
+  large-change-review:
+    name: large-change-review
+    if: github.event.pull_request != null && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Require current core maintainer approval for governed changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fetch_base_file() {
+            local repository_path="$1"
+            local destination="$2"
+            gh api \
+              "repos/$GITHUB_REPOSITORY/contents/$repository_path?ref=$BASE_SHA" \
+              --jq .content | base64 --decode >"$destination"
+          }
+
+          policy_dir="$RUNNER_TEMP/nokv-change-governance"
+          mkdir -p "$policy_dir"
+          fetch_base_file \
+            scripts/ci/pr_change_governance.py \
+            "$policy_dir/pr_change_governance.py"
+          fetch_base_file \
+            scripts/ci/pr_change_governance_test.py \
+            "$policy_dir/pr_change_governance_test.py"
+          fetch_base_file \
+            .github/CODEOWNERS \
+            "$policy_dir/CODEOWNERS"
+          fetch_base_file \
+            .github/workflows/change-governance.yml \
+            "$policy_dir/change-governance.yml"
+          NOKV_CODEOWNERS_PATH="$policy_dir/CODEOWNERS" \
+            NOKV_CHANGE_GOVERNANCE_WORKFLOW_PATH="$policy_dir/change-governance.yml" \
+            python3 "$policy_dir/pr_change_governance_test.py"
+          python3 "$policy_dir/pr_change_governance.py" \
+            --repository "$GITHUB_REPOSITORY" \
+            --pull-request "$PR_NUMBER"

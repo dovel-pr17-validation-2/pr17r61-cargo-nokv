@@ -1,0 +1,107 @@
+<!--
+Copyright 2024-2026 The NoKV Authors.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Change Governance
+
+NoKV treats merge authority as a closed contract. A passing test suite is not
+permission to merge an unreviewed metadata, recovery, object-lifetime, wire,
+SDK, or Workbench rewrite.
+
+## Enforced Policy
+
+The `main` branch must enforce all of the following through GitHub branch
+protection:
+
+- an ordinary pull request with 5,000 or fewer changed lines does not require
+  review;
+- a pull request with more than 5,000 changed lines requires one core
+  maintainer approval on its exact current head;
+- the current-head pusher cannot supply that approval;
+- unresolved review conversations block merge;
+- administrators are subject to the same restrictions;
+- PR titles and descriptions follow the
+  [required format](../../CONTRIBUTING.md#pr-description-format), enforced by
+  the required `pr-description` check;
+- the branch must be current with `main` and every required status must pass.
+
+GitHub-reported additions plus deletions are the review-size measure. The
+author, current-head pusher, bots, non-core reviewers, duplicate reviews,
+dismissed reviews, requested changes, and approvals against an older head do
+not count. Generated files, fixtures, documentation, and deletions are not
+exempt.
+
+The native `Change Governance / large-change-review` job enforces this single
+size threshold. Changes at or below 5,000 lines do not require review from this
+gate, including changes to CI, qualification, release, workflow, or CODEOWNERS
+files. For a larger change, it identifies the actor who introduced the current
+head from the earliest GitHub Actions `pull_request` run for that head.
+Missing, malformed, paginated-beyond-bound, or unavailable PR, review,
+workflow-run, or pusher data fails closed for every large change.
+
+## Trust Boundary
+
+[`change-governance.yml`](../../.github/workflows/change-governance.yml) uses
+`pull_request_target` and `pull_request_review` so GitHub loads the workflow
+from protected `main`. It never checks out or executes pull-request code. The
+runner fetches the policy and tests from the pull request's exact base SHA. The
+native GitHub Actions job conclusion is the required branch-protection check;
+the workflow does not publish a second custom commit status.
+
+This distinction is required: a normal `pull_request` workflow is part of the
+proposed diff and can otherwise weaken the check that evaluates itself.
+
+[`pr-description.yml`](../../.github/workflows/pr-description.yml) applies the
+same protected-base boundary to PR metadata. It reads the live title and body
+through `gh`, treats them only as data, and fetches the validator from the exact
+base SHA. It also passes the author's login from the same API response; only
+`dependabot[bot]` is exempt from the body sections, never from the title rule.
+It reruns on `edited` as well as creation, reopening, pushes, and
+ready-for-review events. A manual dispatch can recheck a PR with the current
+protected policy. Candidate policy regression tests run separately in
+[`pr-description-tests.yml`](../../.github/workflows/pr-description-tests.yml),
+so a skipped candidate job cannot satisfy the metadata check.
+
+The required status set is:
+
+- `nokv-workspace`;
+- `object-namespace-recovery`;
+- `workbench-contract`;
+- `signoff`;
+- `large-change-review`.
+
+The PR writing policy additionally requires `pr-description` and
+`pr-description-tests`. Enable the new required checks after the introducing
+PR has merged and the protected workflow is available; then verify the live
+branch-protection settings without removing existing checks.
+
+Every validation job that runs for each pull-request head is required. The
+Docker `image` check is the only CI exception: it continues in the background
+and reports failures, but its runtime does not delay a merge. `sync-project` is
+project-board automation, does not run on `synchronize`, and is not a merge
+validation or required check.
+
+The native `large-change-review` check was added to branch protection before
+the legacy custom `change-governance/large-change-review` status was removed.
+That ordering avoided both a fail-open interval and a required context that no
+workflow could satisfy.
+
+## Review Expectations
+
+For a governed change, one non-pusher core maintainer approval is a minimum
+gate, not evidence that a broad rewrite is reviewable. Split a change when it
+crosses logical package or lifecycle boundaries, hides behavior changes among
+mechanical churn, or cannot be reproduced and reviewed within one focused diff.
+For storage changes, reviewers must apply the
+[PR Review Checklist](./pr_review_checklist.md) and retain exact recovery,
+failure, retry, retention, and downstream Workbench evidence.
+
+## Administrative Boundary
+
+Repository rules can constrain administrators while the rules exist. An
+organization owner who can edit repository governance can still delete or
+replace those rules. Preventing that action requires an organization-level
+ruleset with no bypass actors, independent ownership of ruleset administration,
+and organization audit-log monitoring. Repository CI alone cannot provide that
+stronger guarantee.
